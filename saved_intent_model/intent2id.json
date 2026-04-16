@@ -1,0 +1,18 @@
+{
+    "AskForWeather": 0,
+    "DecreaseBrightness": 1,
+    "DecreaseFont": 2,
+    "EnableDarkMode": 3,
+    "GetAuthor": 4,
+    "GetBook": 5,
+    "GetBooksByAuthor": 6,
+    "GetPublishingYear": 7,
+    "Goodbye": 8,
+    "Greeting": 9,
+    "IncreaseBrightness": 10,
+    "IncreaseFont": 11,
+    "NextPage": 12,
+    "OOS": 13,
+    "OpenBook": 14,
+    "SetTimer": 15
+}

@@ -4,4 +4,4 @@ __pycache__/
 .env
 .DS_Store
 env/
-saved_intent_model/
+intent_model.pt

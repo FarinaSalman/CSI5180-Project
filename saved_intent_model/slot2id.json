@@ -1,0 +1,19 @@
+{
+    "B-ANAME": 0,
+    "B-BNAME": 1,
+    "B-DAY": 2,
+    "B-DURATION": 3,
+    "B-INAME": 4,
+    "B-LOCATION": 5,
+    "B-NAME": 6,
+    "I-BNAME": 7,
+    "I-DAY": 8,
+    "I-DURATION": 9,
+    "I-INAME": 10,
+    "I-LOCATION": 11,
+    "I-NAME": 12,
+    "I-NAME)": 13,
+    "O": 14,
+    "O-BNAME": 15,
+    "O-NAME": 16
+}
