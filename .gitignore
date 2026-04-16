@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+env/
+saved_intent_model/
