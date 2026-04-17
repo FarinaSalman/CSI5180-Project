@@ -7,7 +7,7 @@ from pathlib import Path
 
 import simpleaudio as sa
 
-FFMPEG_EXE = "/opt/homebrew/bin/ffmpeg"
+FFMPEG_EXE = r"C:\ffmpeg\ffmpeg.exe"
 
 
 def validate_audio_file(file_path: str | os.PathLike) -> Path:

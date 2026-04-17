@@ -94,3 +94,9 @@ def decrease_brightness():
 
 def toggle_reader_theme():
     push_event("toggle_reader_theme")
+
+def set_input_text(text: str):
+    ui_queue.put({
+        "type": "set_input_text",
+        "payload": {"text": text or ""}
+    })
