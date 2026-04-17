@@ -950,8 +950,17 @@ def fulfill_intent(request):
     intent = request["intent"]
     slots = request.get("slots", {})
 
-    if intent in ["Greeting", "Goodbye", "SetTimer", "SetAlarm"]:
+    if intent in ["Greeting", "Goodbye"]:
         return generate_basic_answer(intent, slots)
+    
+    elif intent in ["SetTimer", "SetAlarm"]:
+        duration_text = slots.get("duration")
+        seconds = duration_to_seconds(duration_text)
+
+        if seconds is None:
+            return "I understood that you want a timer, but I couldn’t tell the duration."
+
+        return generate_basic_answer(intent, {"duration": duration_text})
 
     elif intent == "AskForWeather":
         city = (
@@ -1045,12 +1054,12 @@ def duration_to_seconds(duration_value):
         return None
 
     text = str(duration_value).strip().lower()
-
-    # normalize separators
     text = text.replace("-", " ")
     text = re.sub(r"\s+", " ", text).strip()
 
     word_to_num = {
+        "a": 1,
+        "an": 1,
         "one": 1,
         "two": 2,
         "three": 3,
@@ -1071,31 +1080,45 @@ def duration_to_seconds(duration_value):
         "eighteen": 18,
         "nineteen": 19,
         "twenty": 20,
+        "thirty": 30,
+        "forty": 40,
+        "fifty": 50,
+        "sixty": 60,
     }
 
-    parts = text.split()
+    if text in {"half an hour", "half hour"}:
+        return 30 * 60
 
-    if not parts:
-        return None
+    # normalize simple word numbers
+    for word, num in sorted(word_to_num.items(), key=lambda x: -len(x[0])):
+        text = re.sub(rf"\b{re.escape(word)}\b", str(num), text)
 
-    first = parts[0]
+    # handle "1 minute 30 seconds"
+    matches = re.findall(r"(\d+)\s*(hour|hours|hr|hrs|minute|minutes|min|mins|second|seconds|sec|secs)", text)
 
-    if first.isdigit():
-        number = int(first)
-    elif first in word_to_num:
-        number = word_to_num[first]
-    else:
-        return None
+    if matches:
+        total = 0
+        for value, unit in matches:
+            value = int(value)
+            if unit.startswith(("hour", "hr")):
+                total += value * 3600
+            elif unit.startswith(("minute", "min")):
+                total += value * 60
+            elif unit.startswith(("second", "sec")):
+                total += value
+        return total if total > 0 else None
 
-    # default to minutes
-    unit = parts[1] if len(parts) > 1 else "minute"
+    # fallback: bare number defaults to minutes
+    bare = re.fullmatch(r"(\d+)", text)
+    if bare:
+        return int(bare.group(1)) * 60
 
-    if unit.startswith("sec"):
-        return number
-    if unit.startswith("hour") or unit.startswith("hr"):
-        return number * 3600
+    # fallback: phrases like "for 5"
+    partial = re.search(r"\bfor\s+(\d+)\b", text)
+    if partial:
+        return int(partial.group(1)) * 60
 
-    return number * 60
+    return None
 
 def update_ui_from_intent(intent_result, fulfillment_text):
     if not intent_result:
@@ -1111,7 +1134,7 @@ def update_ui_from_intent(intent_result, fulfillment_text):
         if seconds is not None:
             start_timer(seconds)
         else:
-            start_timer()
+            return
 
     elif intent == "OpenBook":
         matched_title = ereader_state.get("current_book")

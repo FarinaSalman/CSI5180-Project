@@ -50,14 +50,16 @@ def add_history_message(history: list, role: str, text: str):
 
 def start_timer_data(timer_data: dict, duration: int | None = None):
     timer_data = dict(timer_data or {})
-    if duration is not None:
-        timer_data["duration"] = duration
-        timer_data["elapsed"] = 0
 
-    now = time.time()
+    if duration is None or duration <= 0:
+        timer_data["status"] = "stopped"
+        timer_data["start_time"] = None
+        return timer_data
+
+    timer_data["duration"] = duration
+    timer_data["elapsed"] = 0
     timer_data["status"] = "running"
-    timer_data["start_time"] = now
-
+    timer_data["start_time"] = time.time()
     return timer_data
 
 
