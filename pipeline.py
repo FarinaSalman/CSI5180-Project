@@ -168,6 +168,15 @@ pipeline_control_state = {
     "final_answer": None,
 }
 
+pending_book_selection = {
+    "active": False,
+    "intent": None,
+    "query": "",
+    "results": [],
+    "page": 0,
+    "page_size": 5,
+}
+
 # Core State Management
 # Holds assistant state across pipeline
 @dataclass
@@ -880,6 +889,129 @@ def extract_book_info(data):
       "docs": data["docs"]
   }
 
+def get_top_book_candidates(data, limit=10):
+    if data is None or "docs" not in data or len(data["docs"]) == 0:
+        return []
+
+    candidates = []
+    for doc in data["docs"][:limit]:
+        candidates.append({
+            "title": doc.get("title", "Unknown title"),
+            "author": ", ".join(doc.get("author_name", ["Unknown author"])),
+            "year": doc.get("first_publish_year", "Unknown year"),
+            "doc": doc,
+        })
+    return candidates
+
+def get_candidate_page():
+    if not pending_book_selection["active"]:
+        return []
+
+    start = pending_book_selection["page"] * pending_book_selection["page_size"]
+    end = start + pending_book_selection["page_size"]
+    return pending_book_selection["results"][start:end]
+
+def advance_candidate_page():
+    total = len(pending_book_selection["results"])
+    page_size = pending_book_selection["page_size"]
+    next_start = (pending_book_selection["page"] + 1) * page_size
+
+    if next_start >= total:
+        return None
+
+    pending_book_selection["page"] += 1
+    return get_candidate_page()
+
+def handle_book_candidate_selection(index: int):
+    global pending_book_selection
+
+    if not pending_book_selection["active"]:
+        add_assistant_message("There is no active book selection.")
+        return
+
+    page_options = get_candidate_page()
+    if index < 0 or index >= len(page_options):
+        add_assistant_message("That book selection is invalid.")
+        return
+
+    selected = page_options[index]
+    doc = selected["doc"]
+    intent = pending_book_selection["intent"]
+    query = pending_book_selection["query"]
+
+    info = {
+        "title": doc.get("title", "Unknown title"),
+        "author_name": doc.get("author_name", ["Unknown author"]),
+        "first_publish_year": doc.get("first_publish_year", "Unknown year"),
+        "docs": [doc],
+    }
+
+    slots = {"book_title": query}
+    response_text = generate_book_answer(intent, slots, info)
+
+    pending_book_selection = {
+        "active": False,
+        "intent": None,
+        "query": "",
+        "results": [],
+        "page": 0,
+        "page_size": 5,
+    }
+
+    clear_book_candidates()
+    deliver_assistant_response(response_text, {"intent": intent, "slots": slots})
+    transition_after_response({"intent": intent, "slots": slots})
+
+def handle_book_candidate_next_page():
+    global pending_book_selection
+
+    if not pending_book_selection["active"]:
+        add_assistant_message("There is no active book selection.")
+        return
+
+    next_page = advance_candidate_page()
+
+    if next_page is None:
+        clear_book_candidates()
+        add_assistant_message(
+            "I couldn’t find the right match. Try a more specific title or include the author."
+        )
+        pending_book_selection = {
+            "active": False,
+            "intent": None,
+            "query": "",
+            "results": [],
+            "page": 0,
+            "page_size": 5,
+        }
+        return
+
+    show_book_candidates(
+        pending_book_selection["query"],
+        next_page,
+        pending_book_selection["page"],
+        len(pending_book_selection["results"]),
+    )
+    deliver_assistant_response(
+        "Here are more matches. Please choose one.",
+        {"intent": pending_book_selection["intent"], "slots": {}},
+    )
+
+def handle_book_candidate_cancel():
+    global pending_book_selection
+
+    pending_book_selection = {
+        "active": False,
+        "intent": None,
+        "query": "",
+        "results": [],
+        "page": 0,
+        "page_size": 5,
+    }
+
+    clear_book_candidates()
+    add_assistant_message("Book selection canceled.")
+
 # Handles e-reader control actions
 def fulfill_ereader_control(intent, slots):
     if intent == "OpenBook":
@@ -1002,12 +1134,24 @@ def fulfill_intent(request):
             return "Sorry, I need a book title for that request"
 
         data = call_open_library_search_api(title=book_title)
-        info = extract_book_info(data)
+        candidates = get_top_book_candidates(data, limit=10)
 
-        if info is None:
+        if not candidates:
             return "Sorry, I could not find that book."
 
-        return generate_book_answer(intent, slots, info)
+        global pending_book_selection
+        pending_book_selection = {
+            "active": True,
+            "intent": intent,
+            "query": book_title,
+            "results": candidates,
+            "page": 0,
+            "page_size": 5,
+        }
+
+        first_page = candidates[:5]
+        show_book_candidates(book_title, first_page, page=0, total=len(candidates))
+        return "__AWAITING_BOOK_SELECTION__"
 
     elif intent == "GetBooksByAuthor":
         author_name = (
@@ -1475,6 +1619,10 @@ from ui_bridge import (
     decrease_brightness,
     toggle_reader_theme,
     set_input_text,
+    show_book_candidates,
+    clear_book_candidates,
+    select_book_candidate,
+    next_book_candidate_page,
 )
 
 def transition_after_response(intent_result: dict | None):
@@ -1496,6 +1644,22 @@ from listen_and_transcribe import listen_until_silence
 # Ensures that Input is being done in order
 def handle_text_bypass_input(text: str):
     global pipeline_control_state
+
+    if text.startswith("__select_candidate__:"):
+        try:
+            idx = int(text.split(":")[-1])
+            handle_book_candidate_selection(idx)
+        except ValueError:
+            add_assistant_message("Invalid book selection.")
+        return
+
+    if text == "__next_candidate_page__":
+        handle_book_candidate_next_page()
+        return
+
+    if text == "__cancel_candidate_selection__":
+        handle_book_candidate_cancel()
+        return
 
     text = (text or "").strip()
     if not text:
@@ -1599,7 +1763,12 @@ def handle_asr_bypass(text: str):
 
     fulfillment_result = fulfill_intent(intent_result)
     pipeline_control_state["fulfillment_result"] = fulfillment_result
-
+    if fulfillment_result == "__AWAITING_BOOK_SELECTION__":
+        deliver_assistant_response(
+            f"I found multiple matches for {pending_book_selection['query']}. Please select the correct option.",
+            intent_result,
+        )
+        return
     update_ui_from_intent(intent_result, fulfillment_result)
 
     # special case: goodbye should reset immediately after responding
@@ -1683,6 +1852,17 @@ def handle_text_command(text: str):
         )
 
         fulfillment_result = fulfill_intent(intent_result)
+
+        if fulfillment_result == "__AWAITING_BOOK_SELECTION__":
+            deliver_assistant_response(
+                f"I found multiple matches for {pending_book_selection['query']}. Please select the correct option.",
+                intent_result,
+            )
+            return {
+                "transcript": cleaned,
+                "intent_result": intent_result,
+                "fulfillment_result": fulfillment_result,
+            }
 
         update_ui_from_intent(intent_result, fulfillment_result)
         deliver_assistant_response(fulfillment_result, intent_result)
@@ -1870,6 +2050,13 @@ def handle_live_voice_pipeline():
             fulfillment_result = fulfill_intent(intent_result)
             pipeline_control_state["fulfillment_result"] = fulfillment_result
 
+            if fulfillment_result == "__AWAITING_BOOK_SELECTION__":
+                deliver_assistant_response(
+                    f"I found multiple matches for {pending_book_selection['query']}. Please select the correct option.",
+                    intent_result,
+                )
+                return
+
             update_ui_from_intent(intent_result, fulfillment_result)
             transition_after_response(intent_result)
             deliver_assistant_response(fulfillment_result, intent_result)
@@ -1916,7 +2103,7 @@ def handle_live_voice_pipeline():
 
 
 def reset_pipeline_state():
-    global pipeline_control_state, ereader_state
+    global pipeline_control_state, ereader_state, pending_book_selection
 
     pipeline_control_state = {
         "current_stage": "verification",
@@ -1933,6 +2120,15 @@ def reset_pipeline_state():
         "current_page": 0,
         "reading_session": False,
         "dark_mode": False,
+    }
+
+    pending_book_selection = {
+        "active": False,
+        "intent": None,
+        "query": "",
+        "results": [],
+        "page": 0,
+        "page_size": 5,
     }
 
     clear_history()

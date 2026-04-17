@@ -19,7 +19,11 @@ BOOKS_PATH = Path(__file__).with_name("books.json")
 with open(BOOKS_PATH, "r", encoding="utf-8") as f:
     BOOKS_DB = json.load(f)
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.BOOTSTRAP],
+    suppress_callback_exceptions=True,
+)
 
 
 def send_text_to_pipeline(text: str):
@@ -168,6 +172,17 @@ app.layout = html.Div(
         dcc.Interval(id="timer-interval", interval=1000, n_intervals=0),
         dcc.Interval(id="bridge-poll", interval=250, n_intervals=0),
 
+        dcc.Store(
+            id="book-candidate-state",
+            data={
+                "active": False,
+                "query": "",
+                "options": [],
+                "page": 0,
+                "total": 0,
+            },
+        ),
+
         html.Div(
             className="container-fluid py-4",
             children=[
@@ -307,6 +322,32 @@ app.layout = html.Div(
                     ],
                 ),
                 html.Div(
+                    className="row g-4 mb-4",
+                    children=[
+                        html.Div(
+                            className="col-12",
+                            children=[
+                                html.Div(
+                                    className="card shadow-sm border-0",
+                                    children=[
+                                        html.Div(
+                                            className="card-body",
+                                            children=[
+                                                html.H4("Book Search Matches", className="mb-3"),
+                                                html.Div(
+                                                    id="book-candidate-panel",
+                                                    className="text-muted",
+                                                    children="No book disambiguation needed",
+                                                ),
+                                            ],
+                                        )
+                                    ],
+                                )
+                            ],
+                        )
+                    ],
+                ),
+                html.Div(
                     className="row",
                     children=[
                         html.Div(
@@ -422,6 +463,130 @@ def render_wake_badge(wake_state):
         return "AWAKE", "badge text-bg-info fs-6 px-3 py-2"
     return "ASLEEP", "badge text-bg-dark fs-6 px-3 py-2"
 
+@app.callback(
+    Output("book-candidate-panel", "children"),
+    Input("book-candidate-state", "data"),
+)
+def render_book_candidate_panel(candidate_state):
+    candidate_state = candidate_state or {}
+    active = candidate_state.get("active", False)
+
+    if not active:
+        return html.Div(
+            "No book disambiguation needed",
+            className="text-muted",
+        )
+
+    query = candidate_state.get("query", "")
+    options = candidate_state.get("options", [])
+    page = candidate_state.get("page", 0)
+    total = candidate_state.get("total", 0)
+
+    if not options:
+        return html.Div(
+            "No candidate options available",
+            className="text-muted",
+        )
+
+    children = [
+        html.P(
+            f"I found multiple matches for '{query}'. Please choose one.",
+            className="mb-3",
+        )
+    ]
+
+    start_number = page * 5 + 1
+
+    for i, option in enumerate(options):
+        title = option.get("title", "Unknown title")
+        author = option.get("author", "Unknown author")
+        year = option.get("year", "Unknown year")
+
+        children.append(
+            html.Button(
+                f"{start_number + i}. {title} — {author} — {year}",
+                id={"type": "candidate-select", "index": i},
+                n_clicks=0,
+                className="btn btn-outline-primary w-100 text-start mb-2",
+            )
+        )
+
+    controls = [
+        html.Button(
+            "None of these — Show more",
+            id="candidate-next-page",
+            n_clicks=0,
+            className="btn btn-outline-secondary me-2",
+        ),
+        html.Button(
+            "Cancel",
+            id="candidate-cancel",
+            n_clicks=0,
+            className="btn btn-outline-danger",
+        ),
+    ]
+
+    children.append(html.Div(controls, className="mt-3"))
+    children.append(
+        html.Div(
+            f"Showing page {page + 1} of {max(1, (total + 4) // 5)}",
+            className="text-muted mt-2",
+        )
+    )
+
+    return children
+
+@app.callback(
+    Output("input-text", "value", allow_duplicate=True),
+    Input({"type": "candidate-select", "index": ALL}, "n_clicks"),
+    Input("candidate-next-page", "n_clicks"),
+    Input("candidate-cancel", "n_clicks"),
+    State("book-candidate-state", "data"),
+    prevent_initial_call=True,
+)
+def handle_book_candidate_actions(candidate_clicks, next_page_clicks, cancel_clicks, candidate_state):
+    candidate_state = candidate_state or {}
+    if not candidate_state.get("active", False):
+        return no_update
+    
+    triggered = ctx.triggered_id
+
+    if triggered is None:
+        return no_update
+
+    # Candidate button clicked
+    if isinstance(triggered, dict) and triggered.get("type") == "candidate-select":
+        idx = triggered["index"]
+
+        if not candidate_clicks:
+            return no_update
+
+        if idx >= len(candidate_clicks):
+            return no_update
+
+        if not candidate_clicks[idx]:
+            return no_update
+
+        send_text_to_pipeline(f"__select_candidate__:{idx}")
+        return ""
+
+    # Next page clicked
+    if triggered == "candidate-next-page":
+        if not next_page_clicks:
+            return no_update
+
+        send_text_to_pipeline("__next_candidate_page__")
+        return ""
+
+    # Cancel clicked
+    if triggered == "candidate-cancel":
+        if not cancel_clicks:
+            return no_update
+
+        send_text_to_pipeline("__cancel_candidate_selection__")
+        return ""
+
+    return no_update
 
 @app.callback(
     Output("output-history", "children"),
@@ -675,6 +840,7 @@ def update_reader_state(
     Output("history-state", "data"),
     Output("timer-state", "data"),
     Output("reader-state", "data"),
+    Output("book-candidate-state", "data"),
     Input("bridge-poll", "n_intervals"),
     State("system-state", "data"),
     State("listening-state", "data"),
@@ -682,6 +848,7 @@ def update_reader_state(
     State("history-state", "data"),
     State("timer-state", "data"),
     State("reader-state", "data"),
+    State("book-candidate-state", "data"),
 )
 def process_bridge_events(
     _n_intervals,
@@ -691,8 +858,17 @@ def process_bridge_events(
     history,
     timer_state,
     reader_state,
+    book_candidate_state,
 ):
     updated = False
+
+    book_candidate_state = book_candidate_state or {
+        "active": False,
+        "query": "",
+        "options": [],
+        "page": 0,
+        "total": 0,
+    }
 
     while True:
         try:
@@ -797,11 +973,30 @@ def process_bridge_events(
         elif event_type == "toggle_reader_theme":
             reader_state["dark_mode"] = not reader_state.get("dark_mode", False)
             updated = True
+        elif event_type == "show_book_candidates":
+            book_candidate_state = {
+                "active": True,
+                "query": payload.get("query", ""),
+                "options": payload.get("options", []),
+                "page": payload.get("page", 0),
+                "total": payload.get("total", 0),
+            }
+            updated = True
+
+        elif event_type == "clear_book_candidates":
+            book_candidate_state = {
+                "active": False,
+                "query": "",
+                "options": [],
+                "page": 0,
+                "total": 0,
+            }
+            updated = True
 
     if not updated:
-        return no_update, no_update, no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update, no_update, no_update
 
-    return system_state, listening_state, wake_state, history, timer_state, reader_state
+    return system_state, listening_state, wake_state, history, timer_state, reader_state, book_candidate_state,
 
 
 if __name__ == "__main__":
