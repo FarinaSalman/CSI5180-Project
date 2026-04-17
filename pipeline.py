@@ -50,7 +50,7 @@ import asyncio
 
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["PATH"] = "/opt/homebrew/bin/:" + os.environ["PATH"]
+os.environ["PATH"] = r"C:\ffmpeg;" + os.environ["PATH"]
 
 from pathlib import Path
 from collections import defaultdict
@@ -73,16 +73,10 @@ import subprocess
 from pydub.utils import which
 from pathlib import Path
 
-print("ffprobe from pydub:", which("ffprobe"))
 
-FFMPEG = "/opt/homebrew/bin//ffmpeg"
-FFPROBE = "/opt/homebrew/bin//ffprobe"
+FFMPEG = r"C:\ffmpeg\ffmpeg.exe"
+FFPROBE = r"C:\ffmpeg\ffprobe.exe"
 
-print("ffmpeg exists:", os.path.isfile(FFMPEG))
-print("ffprobe exists:", os.path.isfile(FFPROBE))
-
-subprocess.run([FFMPEG, "-version"], check=True)
-subprocess.run([FFPROBE, "-version"], check=True)
 
 AudioSegment.converter = FFMPEG
 AudioSegment.ffmpeg = FFMPEG
@@ -128,9 +122,9 @@ N_MFCC = 13
 WINDOW_SEC = 0.025
 HOP_SEC = 0.025
 
-EMBED_THRESHOLD = 0.70
-MFCC_THRESHOLD = 0.55
-FINAL_THRESHOLD = 0.67
+EMBED_THRESHOLD = 0.90
+MFCC_THRESHOLD = 0.85
+FINAL_THRESHOLD = 0.89
 EMBED_WEIGHT = 0.80
 MFCC_WEIGHT = 0.20
 
@@ -429,7 +423,7 @@ def verify_any_user(test_file, pin=None):
 WAKE_WORD_TEXT = "hey atlas"
 DURATION = 2.25
 NUM_SAMPLES = int(TARGET_SR * DURATION)
-WAKE_THRESHOLD = 0.50
+WAKE_THRESHOLD = 0.70
 
 def pad_or_truncate_audio(y, num_samples=NUM_SAMPLES):
     if len(y) > num_samples:
@@ -1450,6 +1444,7 @@ from ui_bridge import (
     increase_brightness,
     decrease_brightness,
     toggle_reader_theme,
+    set_input_text,
 )
 
 def transition_after_response(intent_result: dict | None):
@@ -1458,13 +1453,11 @@ def transition_after_response(intent_result: dict | None):
     intent = (intent_result or {}).get("intent")
 
     if intent == "Goodbye":
-        add_assistant_message("Goodbye!")
         reset_pipeline_state()
         return
 
     pipeline_control_state["current_stage"] = "asr"
     pipeline_control_state["wakeword_passed"] = True
-    print("WAKE -> True | reason: ASR")
     set_awake(True)
 
 
@@ -1520,20 +1513,79 @@ def handle_wakeword_bypass(text: str):
     if text.lower() == WAKEWORD_BYPASS_TEXT:
         pipeline_control_state["wakeword_passed"] = True
         pipeline_control_state["current_stage"] = "asr"
-        print("WAKE -> True | reason: ByPass WakeWord")
         set_awake(True)
         add_assistant_message("Wake word bypass accepted. You can now speak your command or enter an ASR correction later.")
     else:
-        print("WAKE -> False | reason: Wrong ByPass WakeWord")
         set_awake(False)
         add_assistant_message("Wake word bypass failed. Enter the correct wake word.")
 
+
+# Handle how to bypass ASR to write the texts
 def handle_asr_bypass(text: str):
     global pipeline_control_state
 
-    pipeline_control_state["transcript"] = text
-    pipeline_control_state["current_stage"] = "intent"
-    add_assistant_message(f"Transcript correction accepted: {text}")
+    cleaned = (text or "").strip()
+    if not cleaned:
+        add_assistant_message("I didn’t receive any text.")
+        return
+
+    pipeline_control_state["transcript"] = cleaned
+
+    intent_result = predict_from_text(
+        cleaned,
+        intent_model,
+        intent_tokenizer,
+        id2intent,
+        id2slot,
+        device,
+    )
+    
+    def fallback_book_intent(transcript: str):
+        t = (transcript or "").strip().lower()
+
+        for title in BOOKS_DB.keys():
+            if title.lower() in t:
+                return {
+                    "intent": "OpenBook",
+                    "confidence": 0.99,
+                    "slots": {"title": title},
+                }
+
+        return None
+
+    if not intent_result or intent_result.get("intent") == "OOS":
+        fallback_result = fallback_book_intent(cleaned)
+        if fallback_result:
+            intent_result = fallback_result
+
+    pipeline_control_state["intent_result"] = intent_result
+
+    if not intent_result or not intent_result.get("intent") or intent_result.get("intent") == "OOS":
+        pipeline_control_state["current_stage"] = "asr"
+        pipeline_control_state["wakeword_passed"] = True
+        set_awake(True)
+        add_assistant_message("I didn’t catch what you meant. Please type that again.")
+        return
+
+    fulfillment_result = fulfill_intent(intent_result)
+    pipeline_control_state["fulfillment_result"] = fulfillment_result
+
+    update_ui_from_intent(intent_result, fulfillment_result)
+
+    # special case: goodbye should reset immediately after responding
+    if intent_result.get("intent") == "Goodbye":
+        add_assistant_message(fulfillment_result)
+
+        try:
+            speak_text_response(fulfillment_result, intent_result)
+        except Exception as e:
+            print(f"TTS/playback error during goodbye: {e}")
+
+        reset_pipeline_state()
+        return
+    
+    deliver_assistant_response(fulfillment_result, intent_result)
+    transition_after_response(intent_result)
 
 
 def handle_intent_bypass(text: str):
@@ -1668,7 +1720,6 @@ def handle_live_voice_pipeline():
 
             if not verification_result["accepted"]:
                 set_locked(True)
-                print("WAKE -> False | reason: Wrong verification")
                 set_awake(False)
                 add_assistant_message(
                     f"Verification failed. Best match: {verification_result['matched_user']} "
@@ -1682,7 +1733,6 @@ def handle_live_voice_pipeline():
             pipeline_control_state["verification_passed"] = True
             pipeline_control_state["current_stage"] = "wakeword"
             set_locked(False)
-            print("WAKE -> False | reason: Verification worked but wakeword did not")
             set_awake(False)
 
             add_assistant_message(
@@ -1708,7 +1758,6 @@ def handle_live_voice_pipeline():
             )
 
             if not wakeword_result["wake_detected"]:
-                print("WAKE -> False | reason: did not wake up")
                 set_awake(False)
                 add_assistant_message(
                     f"Wake word not detected. Score={wakeword_result['score']:.3f}"
@@ -1720,7 +1769,6 @@ def handle_live_voice_pipeline():
 
             pipeline_control_state["wakeword_passed"] = True
             pipeline_control_state["current_stage"] = "asr"
-            print("WAKE -> True | reason: Good wakeword")
             set_awake(True)
 
             add_assistant_message("Wake word detected. Now say your command.")
@@ -1742,7 +1790,6 @@ def handle_live_voice_pipeline():
                 add_assistant_message("I didn’t catch that.")
                 pipeline_control_state["current_stage"] = "asr"
                 pipeline_control_state["wakeword_passed"] = True
-                print("WAKE -> True | reason: Did not detect script")
                 set_awake(True)
                 return None
 
@@ -1783,7 +1830,6 @@ def handle_live_voice_pipeline():
                 add_assistant_message("I didn’t catch what you were saying. Please say that again.")
                 pipeline_control_state["current_stage"] = "asr"
                 pipeline_control_state["wakeword_passed"] = True
-                print("WAKE -> True | reason: intent is missing / unclear / OOS")
                 set_awake(True)
                 return {
                     "stage": "asr_retry",
@@ -1814,7 +1860,6 @@ def handle_live_voice_pipeline():
             )
             pipeline_control_state["current_stage"] = "wakeword"
             pipeline_control_state["wakeword_passed"] = False
-            print("WAKE -> False | reason: any unexpected stage: reset to wakeword instead of blocking")
             set_awake(False)
             return None
 
@@ -2002,11 +2047,3 @@ def find_book_in_db(requested_title: str):
             return title, data
 
     return None, None
-
-
-# # =========================
-# # Run Example
-# # =========================
-
-ww = detect_wakeword("project_dataset_audio/WakeWord_Dataset/positive/Gaffar-positive-1.wav", wake_model=wake_model)
-print(ww)
