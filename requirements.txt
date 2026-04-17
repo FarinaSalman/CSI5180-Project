@@ -23,3 +23,5 @@ accelerate
 sounddevice
 asyncio
 simpleaudio
+kokoro-onnx
+dotenv
