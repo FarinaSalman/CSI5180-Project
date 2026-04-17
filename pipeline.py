@@ -47,6 +47,7 @@ from IPython.display import Audio
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 import asyncio
+import threading
 
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -72,7 +73,8 @@ import shutil
 import subprocess
 from pydub.utils import which
 from pathlib import Path
-
+from kokoro_onnx import Kokoro
+from audio_playback import play_audio, stop_playback
 
 FFMPEG = r"C:\ffmpeg\ffmpeg.exe"
 FFPROBE = r"C:\ffmpeg\ffprobe.exe"
@@ -122,9 +124,9 @@ N_MFCC = 13
 WINDOW_SEC = 0.025
 HOP_SEC = 0.025
 
-EMBED_THRESHOLD = 0.90
-MFCC_THRESHOLD = 0.85
-FINAL_THRESHOLD = 0.89
+EMBED_THRESHOLD = 0.75
+MFCC_THRESHOLD = 0.95
+FINAL_THRESHOLD = 0.75
 EMBED_WEIGHT = 0.80
 MFCC_WEIGHT = 0.20
 
@@ -402,6 +404,13 @@ def verify_any_user(test_file, pin=None):
         and best_mfcc_score >= MFCC_THRESHOLD
         and best_final_score >= FINAL_THRESHOLD
     )
+    print(
+    f"Best user={best_user} | "
+    f"embed={best_embedding_score:.3f} (thr={EMBED_THRESHOLD}) | "
+    f"mfcc={best_mfcc_score:.3f} (thr={MFCC_THRESHOLD}) | "
+    f"final={best_final_score:.3f} (thr={FINAL_THRESHOLD}) | "
+    f"accepted={accepted}"
+)
 
     state_after = "Unlocked" if accepted else "Locked"
 
@@ -1302,51 +1311,24 @@ def generate_qwen_answer(request, max_new_tokens=256):
     return answer
 
 
+
 # =========================
-# Section 7: Text-to-Speech
+# Section 7: Text-to-Speech (Kokoro)
 # =========================
 
-async def generate_tts(text, voice="en-CA-ClaraNeural", output_file="output.mp3"):
-    communicate = edge_tts.Communicate(text=text, voice=voice)
-    await communicate.save(output_file)
-    return output_file
 
+# Load once at module level
+_kokoro_model = None
 
-async def generate_emotional_tts(
-    text,
-    strategy,
-    voice="en-CA-ClaraNeural",
-    output_file="response.mp3",
-):
-    strategy_to_prosody = {
-        "reinforce_positive": {"rate": "+12%", "pitch": "+18Hz", "volume": "+8%"},
-        "supportive": {"rate": "-18%", "pitch": "-8Hz", "volume": "-5%"},
-        "calm_down": {"rate": "-22%", "pitch": "-12Hz", "volume": "-10%"},
-        "reassuring": {"rate": "-10%", "pitch": "-5Hz", "volume": "+0%"},
-        "neutralize": {"rate": "-5%", "pitch": "-2Hz", "volume": "+0%"},
-        "informative": {"rate": "+0%", "pitch": "+0Hz", "volume": "+0%"},
-        "neutral_response": {"rate": "+0%", "pitch": "+0Hz", "volume": "+0%"},
-        "clarify_intent": {"rate": "-8%", "pitch": "+5Hz", "volume": "+0%"},
-        "gentle_probe": {"rate": "-15%", "pitch": "-3Hz", "volume": "-3%"},
-    }
-
-    prosody = strategy_to_prosody.get(strategy, strategy_to_prosody["neutral_response"])
-
-    communicate = edge_tts.Communicate(
-        text=text,
-        voice=voice,
-        rate=prosody["rate"],
-        pitch=prosody["pitch"],
-        volume=prosody["volume"],
-    )
-
-    await communicate.save(output_file)
-    return output_file
+def get_kokoro():
+    global _kokoro_model
+    if _kokoro_model is None:
+        _kokoro_model = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
+    return _kokoro_model
 
 
 def choose_tts_strategy(request):
     intent = request["intent"]
-
     if intent in ["Greeting", "Goodbye"]:
         return "reinforce_positive"
     elif intent in ["SetTimer", "SetAlarm", "OpenBook", "NextPage", "EnableDarkMode"]:
@@ -1355,41 +1337,21 @@ def choose_tts_strategy(request):
         return "informative"
     elif intent == "OOS":
         return "neutralize"
-
     return "neutral_response"
 
 
-async def speak_generated_answer(
-    request,
-    answer_source="template",
-    voice="en-CA-ClaraNeural",
-    output_file="assistant_response.mp3",
-):
-    if answer_source == "template":
-        response_text = fulfill_intent(request)
-    elif answer_source == "qwen":
-        response_text = generate_qwen_answer(request)
-    else:
-        raise ValueError("answer_source must be 'template' or 'qwen'")
-
-    strategy = choose_tts_strategy(request)
-
-    audio_file = await generate_emotional_tts(
-        text=response_text,
-        strategy=strategy,
-        voice=voice,
-        output_file=output_file,
-    )
-
-    return {
-        "request": request,
-        "response_text": response_text,
-        "strategy": strategy,
-        "audio_file": audio_file,
-    }
-
-
-from audio_playback import play_audio
+# Maps strategy to Kokoro speed
+STRATEGY_TO_SPEED = {
+    "reinforce_positive": 1.2,
+    "supportive":         0.85,
+    "calm_down":          0.8,
+    "reassuring":         0.92,
+    "neutralize":         0.95,
+    "informative":        1.0,
+    "neutral_response":   1.0,
+    "clarify_intent":     0.95,
+    "gentle_probe":       0.88,
+}
 
 
 def speak_text_response(response_text: str, intent_result: dict | None = None):
@@ -1398,24 +1360,62 @@ def speak_text_response(response_text: str, intent_result: dict | None = None):
 
     request = intent_result or {"intent": "OOS", "slots": {}}
     strategy = choose_tts_strategy(request)
-    output_file = "assistant_response.mp3"
+    speed = STRATEGY_TO_SPEED.get(strategy, 1.0)
+    # output_file = "assistant_response.wav"
 
-    asyncio.run(
-        generate_emotional_tts(
-            text=response_text,
-            strategy=strategy,
-            voice="en-CA-ClaraNeural",
-            output_file=output_file,
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    output_file = tmp.name
+    tmp.close()
+
+    print(f"DEBUG: TTS generating for strategy={strategy}, speed={speed}")
+
+    try:
+        kokoro = get_kokoro()
+        samples, sample_rate = kokoro.create(
+            response_text,
+            voice="af_bella",   # change voice here if desired
+            speed=speed,
+            lang="en-us",
         )
-    )
 
-    play_audio(output_file, wait=True)
+        sf.write(output_file, samples, sample_rate)
+        print("DEBUG: TTS generation complete.")
+
+    except Exception as e:
+        import traceback
+        print(f"DEBUG: TTS generation error: {e}")
+        traceback.print_exc()
+        return None
+
+    print("DEBUG: Starting audio playback...")
+    try:
+        stop_playback()
+        play_audio(output_file, wait=False)
+        print("DEBUG: Audio playback complete.")
+    except Exception as e:
+        import traceback
+        print(f"DEBUG: Audio playback error: {e}")
+        traceback.print_exc()
+    
     return output_file
 
 
 def deliver_assistant_response(response_text: str, intent_result: dict | None = None):
+    print("DEBUG: before add_assistant_message inside deliver_assistant_response")
     add_assistant_message(response_text)
-    speak_text_response(response_text, intent_result)
+    print("DEBUG: after add_assistant_message inside deliver_assistant_response")
+
+    def _tts_worker():
+        try:
+            print("DEBUG: before speak_text_response inside tts worker")
+            speak_text_response(response_text, intent_result)
+            print("DEBUG: after speak_text_response inside tts worker")
+        except Exception as e:
+            import traceback
+            print(f"DEBUG: TTS worker error: {e}")
+            traceback.print_exc()
+
+    threading.Thread(target=_tts_worker, daemon=True).start()
 
     
 # =========================
@@ -1457,8 +1457,12 @@ def transition_after_response(intent_result: dict | None):
         return
 
     pipeline_control_state["current_stage"] = "asr"
-    pipeline_control_state["wakeword_passed"] = True
+    pipeline_control_state["transcript"] = ""        # clear old transcript
+    pipeline_control_state["intent_result"] = None   # clear old intent
+    pipeline_control_state["fulfillment_result"] = None  # clear old result
+
     set_awake(True)
+    set_listening(False)   # make sure listening indicator resets
 
 
 from listen_and_transcribe import listen_until_silence
@@ -1479,7 +1483,7 @@ def handle_text_bypass_input(text: str):
         handle_verification_bypass(text)
     elif stage == "wakeword":
         handle_wakeword_bypass(text)
-    elif stage == "asr":
+    elif stage in ["asr", "awaiting_asr_confirmation"]:
         handle_asr_bypass(text)
     elif stage == "intent":
         handle_intent_bypass(text)
@@ -1574,18 +1578,19 @@ def handle_asr_bypass(text: str):
 
     # special case: goodbye should reset immediately after responding
     if intent_result.get("intent") == "Goodbye":
-        add_assistant_message(fulfillment_result)
-
-        try:
-            speak_text_response(fulfillment_result, intent_result)
-        except Exception as e:
-            print(f"TTS/playback error during goodbye: {e}")
-
+        deliver_assistant_response(fulfillment_result, intent_result)
         reset_pipeline_state()
         return
     
     deliver_assistant_response(fulfillment_result, intent_result)
-    transition_after_response(intent_result)
+    # set_input_text("")
+    def _delayed_transition():
+        import time
+        time.sleep(0.15)
+        transition_after_response(intent_result)
+
+    threading.Thread(target=_delayed_transition, daemon=True).start()
+    
 
 
 def handle_intent_bypass(text: str):
@@ -1778,10 +1783,11 @@ def handle_live_voice_pipeline():
                 "wakeword_result": wakeword_result,
             }
 
-         # -------------------------
+        # -------------------------
         # STAGE 3: command speech
         # Intent, fulfillment, answer all happen automatically here
         # -------------------------
+
         elif stage == "asr":
             asr_wav = clone_temp_wav(temp_wav_path)
             transcript, _ = transcribe_audio_file(asr_wav, asr_model)
@@ -1793,64 +1799,24 @@ def handle_live_voice_pipeline():
                 set_awake(True)
                 return None
 
+            transcript = transcript.strip()
             pipeline_control_state["transcript"] = transcript
-            add_user_message(transcript)
 
-            intent_result = predict_from_text(
-                transcript,
-                intent_model,
-                intent_tokenizer,
-                id2intent,
-                id2slot,
-                device,
+            # put transcript into the dashboard text area for review
+            set_input_text(transcript)
+
+            # move to a separate waiting stage
+            pipeline_control_state["current_stage"] = "awaiting_asr_confirmation"
+            pipeline_control_state["wakeword_passed"] = True
+            set_awake(True)
+
+            add_assistant_message(
+                "I transcribed your speech. Please review or edit it in the text box, then press Submit."
             )
-
-            def fallback_book_intent(transcript: str):
-                text = (transcript or "").strip().lower()
-
-                for title in BOOKS_DB.keys():
-                    if title.lower() in text:
-                        return {
-                            "intent": "OpenBook",
-                            "confidence": 0.99,
-                            "slots": {"title": title},
-                        }
-
-                return None
-            
-            if not intent_result or intent_result.get("intent") == "OOS":
-                fallback_result = fallback_book_intent(transcript)
-                if fallback_result:
-                    intent_result = fallback_result
-            print("INTENT RESULT:", intent_result)
-            pipeline_control_state["intent_result"] = intent_result
-
-            # if intent is missing / unclear / OOS, ask again and stay in ASR
-            if not intent_result or not intent_result.get("intent") or intent_result.get("intent") == "OOS":
-                add_assistant_message("I didn’t catch what you were saying. Please say that again.")
-                pipeline_control_state["current_stage"] = "asr"
-                pipeline_control_state["wakeword_passed"] = True
-                set_awake(True)
-                return {
-                    "stage": "asr_retry",
-                    "transcript": transcript,
-                    "intent_result": intent_result,
-                }
-
-            fulfillment_result = fulfill_intent(intent_result)
-            pipeline_control_state["fulfillment_result"] = fulfillment_result
-
-            update_ui_from_intent(intent_result, fulfillment_result)
-            transition_after_response(intent_result)
-            deliver_assistant_response(fulfillment_result, intent_result)
-
-            
 
             return {
                 "stage": "asr",
                 "transcript": transcript,
-                "intent_result": intent_result,
-                "fulfillment_result": fulfillment_result,
             }
 
         else:

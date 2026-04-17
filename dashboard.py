@@ -15,11 +15,14 @@ from pipeline import (
     reset_pipeline_state,
 )
 
+
 BOOKS_PATH = Path(__file__).with_name("books.json")
 with open(BOOKS_PATH, "r", encoding="utf-8") as f:
     BOOKS_DB = json.load(f)
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+
+global server_ui_state, ui_state_lock
 
 
 def send_text_to_pipeline(text: str):
@@ -149,6 +152,19 @@ initial_timer_state = {
 }
 initial_reader_state = close_book_data()
 
+
+ui_state_lock = threading.Lock()
+
+server_ui_state = {
+    "system_state": initial_system_state,
+    "listening_state": initial_listening_state,
+    "wake_state": initial_wake_state,
+    "history": initial_history,
+    "timer_state": initial_timer_state,
+    "reader_state": initial_reader_state,
+    "input_text": "",
+}
+
 app.layout = html.Div(
     className="bg-light",
     children=[
@@ -164,7 +180,7 @@ app.layout = html.Div(
         
 
         dcc.Interval(id="timer-interval", interval=1000, n_intervals=0),
-        dcc.Interval(id="bridge-poll", interval=250, n_intervals=0),
+        dcc.Interval(id="bridge-poll", interval=100, n_intervals=0),
 
         html.Div(
             className="container-fluid py-4",
@@ -421,11 +437,43 @@ def render_wake_badge(wake_state):
     return "ASLEEP", "badge text-bg-dark fs-6 px-3 py-2"
 
 
-@app.callback(
-    Output("output-history", "children"),
-    Input("history-state", "data"),
-)
-def render_output_history(history):
+# @app.callback(
+#     Output("output-history", "children"),
+#     Input("history-state", "data"),
+# )
+# def render_output_history(history):
+#     history = history or []
+
+#     if len(history) == 0:
+#         return html.Div(
+#             className="h-100 d-flex justify-content-center align-items-center text-muted",
+#             children="No history yet",
+#         )
+
+#     items = []
+#     for msg in history:
+#         role = msg.get("role", "").lower()
+#         text = msg.get("text", "")
+
+#         if role == "user":
+#             role_label = html.Div("User", className="fw-semibold text-primary")
+#         else:
+#             role_label = html.Div("Assistant", className="fw-semibold text-success")
+
+#         items.append(
+#             html.Div(
+#                 className="mb-3",
+#                 children=[
+#                     role_label,
+#                     html.Div(text, className="mb-2"),
+#                 ],
+#             )
+#         )
+
+#     return items
+
+
+def build_output_history_children(history):
     history = history or []
 
     if len(history) == 0:
@@ -596,6 +644,11 @@ def handle_submit(_n_clicks, input_text):
         return ""
 
     cleaned = input_text.strip()
+
+    with ui_state_lock:
+        server_ui_state["input_text"] = ""
+
+
     send_text_to_pipeline(cleaned)
     return ""
 
@@ -673,133 +726,164 @@ def update_reader_state(
     Output("history-state", "data"),
     Output("timer-state", "data"),
     Output("reader-state", "data"),
+    Output("input-text", "value", allow_duplicate=True),
+    Output("output-history", "children"),
     Input("bridge-poll", "n_intervals"),
-    State("system-state", "data"),
-    State("listening-state", "data"),
-    State("wake-state", "data"),
-    State("history-state", "data"),
-    State("timer-state", "data"),
-    State("reader-state", "data"),
+    prevent_initial_call=True,
 )
-def process_bridge_events(
-    _n_intervals,
-    system_state,
-    listening_state,
-    wake_state,
-    history,
-    timer_state,
-    reader_state,
-):
+def process_bridge_events(_n_intervals):
     updated = False
 
-    while True:
-        try:
-            event = ui_queue.get_nowait()
-        except Empty:
-            break
+    with ui_state_lock:
+        while True:
+            try:
+                event = ui_queue.get_nowait()
+            except Empty:
+                break
 
-        event_type = event.get("type")
-        payload = event.get("payload") or {}
+            event_type = event.get("type")
+            payload = event.get("payload") or {}
 
-        if event_type == "set_locked":
-            system_state = set_system_locked_data(payload.get("locked", False))
-            updated = True
-
-        elif event_type == "set_listening":
-            listening_state = set_listening_data(payload.get("listening", False))
-            updated = True
-
-        elif event_type == "set_awake":
-            wake_state = set_wake_state_data(payload.get("awake", False))
-            updated = True
-
-        elif event_type == "add_user_message":
-            history = add_history_message(history, "user", payload.get("text", ""))
-            updated = True
-
-        elif event_type == "add_assistant_message":
-            history = add_history_message(history, "assistant", payload.get("text", ""))
-            updated = True
-
-        elif event_type == "clear_history":
-            history = []
-            updated = True
-
-        elif event_type == "start_timer":
-            duration = payload.get("duration")
-            timer_state = start_timer_data(timer_state, duration)
-            updated = True
-
-        elif event_type == "pause_timer":
-            timer_state = pause_timer_data(timer_state)
-            updated = True
-
-        elif event_type == "stop_timer":
-            timer_state = stop_timer_data(timer_state)
-            updated = True
-
-        elif event_type == "reset_timer":
-            timer_state = reset_timer_data(timer_state)
-            updated = True
-
-        elif event_type == "open_book":
-            title = payload.get("title", "Untitled")
-
-            if title in BOOKS_DB:
-                reader_state = open_book_data(
-                    title,
-                    BOOKS_DB[title]["pages"],
-                    page_index=payload.get("page_index", 0),
-                    current_state=reader_state,
-                )
-            else:
-                reader_state = open_book_data(
-                    title,
-                    payload.get("pages", []) or [payload.get("content", "")],
-                    page_index=payload.get("page_index", 0),
-                    current_state=reader_state,
-                )
-            updated = True
-
-        elif event_type == "close_book":
-            reader_state = close_book_data(reader_state)
-            updated = True
-
-        elif event_type == "next_page":
-            if reader_state.get("is_open") and reader_state.get("pages"):
-                last_page = len(reader_state["pages"]) - 1
-                reader_state["page_index"] = min(last_page, reader_state["page_index"] + 1)
+            if event_type == "set_locked":
+                server_ui_state["system_state"] = set_system_locked_data(payload.get("locked", False))
                 updated = True
 
-        elif event_type == "prev_page":
-            if reader_state.get("is_open") and reader_state.get("pages"):
-                reader_state["page_index"] = max(0, reader_state["page_index"] - 1)
+            elif event_type == "set_listening":
+                server_ui_state["listening_state"] = set_listening_data(payload.get("listening", False))
                 updated = True
 
-        elif event_type == "increase_font_size":
-            reader_state["font_size"] = min(36, reader_state.get("font_size", 18) + 2)
-            updated = True
+            elif event_type == "set_awake":
+                server_ui_state["wake_state"] = set_wake_state_data(payload.get("awake", False))
+                updated = True
 
-        elif event_type == "decrease_font_size":
-            reader_state["font_size"] = max(12, reader_state.get("font_size", 18) - 2)
-            updated = True
+            elif event_type == "add_user_message":
+                server_ui_state["history"] = add_history_message(
+                    server_ui_state["history"], "user", payload.get("text", "")
+                )
+                updated = True
 
-        elif event_type == "increase_brightness":
-            reader_state["brightness"] = min(140, reader_state.get("brightness", 100) + 10)
-            updated = True
+            elif event_type == "add_assistant_message":
+                server_ui_state["history"] = add_history_message(
+                    server_ui_state["history"], "assistant", payload.get("text", "")
+                )
+                updated = True
 
-        elif event_type == "decrease_brightness":
-            reader_state["brightness"] = max(40, reader_state.get("brightness", 100) - 10)
-            updated = True
+            elif event_type == "clear_history":
+                server_ui_state["history"] = []
+                updated = True
 
-        elif event_type == "toggle_reader_theme":
-            reader_state["dark_mode"] = not reader_state.get("dark_mode", False)
-            updated = True
+            elif event_type == "start_timer":
+                duration = payload.get("duration")
+                server_ui_state["timer_state"] = start_timer_data(server_ui_state["timer_state"], duration)
+                updated = True
 
-    if not updated:
-        return no_update, no_update, no_update, no_update, no_update, no_update
+            elif event_type == "pause_timer":
+                server_ui_state["timer_state"] = pause_timer_data(server_ui_state["timer_state"])
+                updated = True
 
-    return system_state, listening_state, wake_state, history, timer_state, reader_state
+            elif event_type == "stop_timer":
+                server_ui_state["timer_state"] = stop_timer_data(server_ui_state["timer_state"])
+                updated = True
+
+            elif event_type == "reset_timer":
+                server_ui_state["timer_state"] = reset_timer_data(server_ui_state["timer_state"])
+                updated = True
+
+            elif event_type == "open_book":
+                title = payload.get("title", "Untitled")
+                if title in BOOKS_DB:
+                    server_ui_state["reader_state"] = open_book_data(
+                        title,
+                        BOOKS_DB[title]["pages"],
+                        page_index=payload.get("page_index", 0),
+                        current_state=server_ui_state["reader_state"],
+                    )
+                else:
+                    server_ui_state["reader_state"] = open_book_data(
+                        title,
+                        payload.get("pages", []) or [payload.get("content", "")],
+                        page_index=payload.get("page_index", 0),
+                        current_state=server_ui_state["reader_state"],
+                    )
+                updated = True
+
+            elif event_type == "close_book":
+                server_ui_state["reader_state"] = close_book_data(server_ui_state["reader_state"])
+                updated = True
+
+            elif event_type == "next_page":
+                reader_state = dict(server_ui_state["reader_state"])
+                if reader_state.get("is_open") and reader_state.get("pages"):
+                    last_page = len(reader_state["pages"]) - 1
+                    reader_state["page_index"] = min(last_page, reader_state["page_index"] + 1)
+                    server_ui_state["reader_state"] = reader_state
+                    updated = True
+
+            elif event_type == "prev_page":
+                reader_state = dict(server_ui_state["reader_state"])
+                if reader_state.get("is_open") and reader_state.get("pages"):
+                    reader_state["page_index"] = max(0, reader_state["page_index"] - 1)
+                    server_ui_state["reader_state"] = reader_state
+                    updated = True
+
+            elif event_type == "increase_font_size":
+                reader_state = dict(server_ui_state["reader_state"])
+                reader_state["font_size"] = min(36, reader_state.get("font_size", 18) + 2)
+                server_ui_state["reader_state"] = reader_state
+                updated = True
+
+            elif event_type == "decrease_font_size":
+                reader_state = dict(server_ui_state["reader_state"])
+                reader_state["font_size"] = max(12, reader_state.get("font_size", 18) - 2)
+                server_ui_state["reader_state"] = reader_state
+                updated = True
+
+            elif event_type == "increase_brightness":
+                reader_state = dict(server_ui_state["reader_state"])
+                reader_state["brightness"] = min(140, reader_state.get("brightness", 100) + 10)
+                server_ui_state["reader_state"] = reader_state
+                updated = True
+
+            elif event_type == "decrease_brightness":
+                reader_state = dict(server_ui_state["reader_state"])
+                reader_state["brightness"] = max(40, reader_state.get("brightness", 100) - 10)
+                server_ui_state["reader_state"] = reader_state
+                updated = True
+
+            elif event_type == "toggle_reader_theme":
+                reader_state = dict(server_ui_state["reader_state"])
+                reader_state["dark_mode"] = not reader_state.get("dark_mode", False)
+                server_ui_state["reader_state"] = reader_state
+                updated = True
+
+            elif event_type == "set_input_text":
+                server_ui_state["input_text"] = payload.get("text", "")
+                updated = True
+
+        if not updated:
+            return (
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+            )
+
+        history_copy = list(server_ui_state["history"])
+
+        return (
+            dict(server_ui_state["system_state"]),
+            dict(server_ui_state["listening_state"]),
+            dict(server_ui_state["wake_state"]),
+            history_copy,
+            dict(server_ui_state["timer_state"]),
+            dict(server_ui_state["reader_state"]),
+            server_ui_state["input_text"],
+            build_output_history_children(history_copy),
+        )
 
 
 if __name__ == "__main__":
