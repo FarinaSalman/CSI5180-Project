@@ -100,3 +100,20 @@ def set_input_text(text: str):
         "type": "set_input_text",
         "payload": {"text": text or ""}
     })
+
+def show_book_candidates(query: str, options: list, page: int, total: int):
+    push_event("show_book_candidates", {
+        "query": query,
+        "options": options,
+        "page": page,
+        "total": total,
+    })
+
+def clear_book_candidates():
+    push_event("clear_book_candidates")
+
+def select_book_candidate(index: int):
+    push_event("select_book_candidate", {"index": index})
+
+def next_book_candidate_page():
+    push_event("next_book_candidate_page")

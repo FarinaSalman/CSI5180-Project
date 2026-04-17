@@ -48,10 +48,17 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 import asyncio
 import threading
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["PATH"] = r"C:\ffmpeg;" + os.environ["PATH"]
+env_path = os.getenv("PATH")
+
+if env_path:
+    os.environ["PATH"] = env_path + ":" + os.environ["PATH"]
 
 from pathlib import Path
 from collections import defaultdict
@@ -76,8 +83,8 @@ from pathlib import Path
 from kokoro_onnx import Kokoro
 from audio_playback import play_audio, stop_playback
 
-FFMPEG = r"C:\ffmpeg\ffmpeg.exe"
-FFPROBE = r"C:\ffmpeg\ffprobe.exe"
+FFMPEG = os.getenv("FFMPEG")
+FFPROBE = os.getenv("FFPROBE")
 
 
 AudioSegment.converter = FFMPEG
@@ -161,6 +168,15 @@ pipeline_control_state = {
     "intent_result": None,
     "fulfillment_result": None,
     "final_answer": None,
+}
+
+pending_book_selection = {
+    "active": False,
+    "intent": None,
+    "query": "",
+    "results": [],
+    "page": 0,
+    "page_size": 5,
 }
 
 # Core State Management
@@ -882,6 +898,129 @@ def extract_book_info(data):
       "docs": data["docs"]
   }
 
+def get_top_book_candidates(data, limit=10):
+    if data is None or "docs" not in data or len(data["docs"]) == 0:
+        return []
+
+    candidates = []
+    for doc in data["docs"][:limit]:
+        candidates.append({
+            "title": doc.get("title", "Unknown title"),
+            "author": ", ".join(doc.get("author_name", ["Unknown author"])),
+            "year": doc.get("first_publish_year", "Unknown year"),
+            "doc": doc,
+        })
+    return candidates
+
+def get_candidate_page():
+    if not pending_book_selection["active"]:
+        return []
+
+    start = pending_book_selection["page"] * pending_book_selection["page_size"]
+    end = start + pending_book_selection["page_size"]
+    return pending_book_selection["results"][start:end]
+
+def advance_candidate_page():
+    total = len(pending_book_selection["results"])
+    page_size = pending_book_selection["page_size"]
+    next_start = (pending_book_selection["page"] + 1) * page_size
+
+    if next_start >= total:
+        return None
+
+    pending_book_selection["page"] += 1
+    return get_candidate_page()
+
+def handle_book_candidate_selection(index: int):
+    global pending_book_selection
+
+    if not pending_book_selection["active"]:
+        add_assistant_message("There is no active book selection.")
+        return
+
+    page_options = get_candidate_page()
+    if index < 0 or index >= len(page_options):
+        add_assistant_message("That book selection is invalid.")
+        return
+
+    selected = page_options[index]
+    doc = selected["doc"]
+    intent = pending_book_selection["intent"]
+    query = pending_book_selection["query"]
+
+    info = {
+        "title": doc.get("title", "Unknown title"),
+        "author_name": doc.get("author_name", ["Unknown author"]),
+        "first_publish_year": doc.get("first_publish_year", "Unknown year"),
+        "docs": [doc],
+    }
+
+    slots = {"book_title": query}
+    response_text = generate_book_answer(intent, slots, info)
+
+    pending_book_selection = {
+        "active": False,
+        "intent": None,
+        "query": "",
+        "results": [],
+        "page": 0,
+        "page_size": 5,
+    }
+
+    clear_book_candidates()
+    deliver_assistant_response(response_text, {"intent": intent, "slots": slots})
+    transition_after_response({"intent": intent, "slots": slots})
+
+def handle_book_candidate_next_page():
+    global pending_book_selection
+
+    if not pending_book_selection["active"]:
+        add_assistant_message("There is no active book selection.")
+        return
+
+    next_page = advance_candidate_page()
+
+    if next_page is None:
+        clear_book_candidates()
+        add_assistant_message(
+            "I couldn’t find the right match. Try a more specific title or include the author."
+        )
+        pending_book_selection = {
+            "active": False,
+            "intent": None,
+            "query": "",
+            "results": [],
+            "page": 0,
+            "page_size": 5,
+        }
+        return
+
+    show_book_candidates(
+        pending_book_selection["query"],
+        next_page,
+        pending_book_selection["page"],
+        len(pending_book_selection["results"]),
+    )
+    deliver_assistant_response(
+        "Here are more matches. Please choose one.",
+        {"intent": pending_book_selection["intent"], "slots": {}},
+    )
+
+def handle_book_candidate_cancel():
+    global pending_book_selection
+
+    pending_book_selection = {
+        "active": False,
+        "intent": None,
+        "query": "",
+        "results": [],
+        "page": 0,
+        "page_size": 5,
+    }
+
+    clear_book_candidates()
+    add_assistant_message("Book selection canceled.")
+
 # Handles e-reader control actions
 def fulfill_ereader_control(intent, slots):
     if intent == "OpenBook":
@@ -952,8 +1091,17 @@ def fulfill_intent(request):
     intent = request["intent"]
     slots = request.get("slots", {})
 
-    if intent in ["Greeting", "Goodbye", "SetTimer", "SetAlarm"]:
+    if intent in ["Greeting", "Goodbye"]:
         return generate_basic_answer(intent, slots)
+    
+    elif intent in ["SetTimer", "SetAlarm"]:
+        duration_text = slots.get("duration")
+        seconds = duration_to_seconds(duration_text)
+
+        if seconds is None:
+            return "I understood that you want a timer, but I couldn’t tell the duration."
+
+        return generate_basic_answer(intent, {"duration": duration_text})
 
     elif intent == "AskForWeather":
         city = (
@@ -995,12 +1143,24 @@ def fulfill_intent(request):
             return "Sorry, I need a book title for that request"
 
         data = call_open_library_search_api(title=book_title)
-        info = extract_book_info(data)
+        candidates = get_top_book_candidates(data, limit=10)
 
-        if info is None:
+        if not candidates:
             return "Sorry, I could not find that book."
 
-        return generate_book_answer(intent, slots, info)
+        global pending_book_selection
+        pending_book_selection = {
+            "active": True,
+            "intent": intent,
+            "query": book_title,
+            "results": candidates,
+            "page": 0,
+            "page_size": 5,
+        }
+
+        first_page = candidates[:5]
+        show_book_candidates(book_title, first_page, page=0, total=len(candidates))
+        return "__AWAITING_BOOK_SELECTION__"
 
     elif intent == "GetBooksByAuthor":
         author_name = (
@@ -1047,12 +1207,12 @@ def duration_to_seconds(duration_value):
         return None
 
     text = str(duration_value).strip().lower()
-
-    # normalize separators
     text = text.replace("-", " ")
     text = re.sub(r"\s+", " ", text).strip()
 
     word_to_num = {
+        "a": 1,
+        "an": 1,
         "one": 1,
         "two": 2,
         "three": 3,
@@ -1073,31 +1233,45 @@ def duration_to_seconds(duration_value):
         "eighteen": 18,
         "nineteen": 19,
         "twenty": 20,
+        "thirty": 30,
+        "forty": 40,
+        "fifty": 50,
+        "sixty": 60,
     }
 
-    parts = text.split()
+    if text in {"half an hour", "half hour"}:
+        return 30 * 60
 
-    if not parts:
-        return None
+    # normalize simple word numbers
+    for word, num in sorted(word_to_num.items(), key=lambda x: -len(x[0])):
+        text = re.sub(rf"\b{re.escape(word)}\b", str(num), text)
 
-    first = parts[0]
+    # handle "1 minute 30 seconds"
+    matches = re.findall(r"(\d+)\s*(hour|hours|hr|hrs|minute|minutes|min|mins|second|seconds|sec|secs)", text)
 
-    if first.isdigit():
-        number = int(first)
-    elif first in word_to_num:
-        number = word_to_num[first]
-    else:
-        return None
+    if matches:
+        total = 0
+        for value, unit in matches:
+            value = int(value)
+            if unit.startswith(("hour", "hr")):
+                total += value * 3600
+            elif unit.startswith(("minute", "min")):
+                total += value * 60
+            elif unit.startswith(("second", "sec")):
+                total += value
+        return total if total > 0 else None
 
-    # default to minutes
-    unit = parts[1] if len(parts) > 1 else "minute"
+    # fallback: bare number defaults to minutes
+    bare = re.fullmatch(r"(\d+)", text)
+    if bare:
+        return int(bare.group(1)) * 60
 
-    if unit.startswith("sec"):
-        return number
-    if unit.startswith("hour") or unit.startswith("hr"):
-        return number * 3600
+    # fallback: phrases like "for 5"
+    partial = re.search(r"\bfor\s+(\d+)\b", text)
+    if partial:
+        return int(partial.group(1)) * 60
 
-    return number * 60
+    return None
 
 def update_ui_from_intent(intent_result, fulfillment_text):
     if not intent_result:
@@ -1113,7 +1287,7 @@ def update_ui_from_intent(intent_result, fulfillment_text):
         if seconds is not None:
             start_timer(seconds)
         else:
-            start_timer()
+            return
 
     elif intent == "OpenBook":
         matched_title = ereader_state.get("current_book")
@@ -1445,6 +1619,10 @@ from ui_bridge import (
     decrease_brightness,
     toggle_reader_theme,
     set_input_text,
+    show_book_candidates,
+    clear_book_candidates,
+    select_book_candidate,
+    next_book_candidate_page,
 )
 
 def transition_after_response(intent_result: dict | None):
@@ -1470,6 +1648,22 @@ from listen_and_transcribe import listen_until_silence
 # Ensures that Input is being done in order
 def handle_text_bypass_input(text: str):
     global pipeline_control_state
+
+    if text.startswith("__select_candidate__:"):
+        try:
+            idx = int(text.split(":")[-1])
+            handle_book_candidate_selection(idx)
+        except ValueError:
+            add_assistant_message("Invalid book selection.")
+        return
+
+    if text == "__next_candidate_page__":
+        handle_book_candidate_next_page()
+        return
+
+    if text == "__cancel_candidate_selection__":
+        handle_book_candidate_cancel()
+        return
 
     text = (text or "").strip()
     if not text:
@@ -1573,7 +1767,12 @@ def handle_asr_bypass(text: str):
 
     fulfillment_result = fulfill_intent(intent_result)
     pipeline_control_state["fulfillment_result"] = fulfillment_result
-
+    if fulfillment_result == "__AWAITING_BOOK_SELECTION__":
+        deliver_assistant_response(
+            f"I found multiple matches for {pending_book_selection['query']}. Please select the correct option.",
+            intent_result,
+        )
+        return
     update_ui_from_intent(intent_result, fulfillment_result)
 
     # special case: goodbye should reset immediately after responding
@@ -1658,6 +1857,17 @@ def handle_text_command(text: str):
         )
 
         fulfillment_result = fulfill_intent(intent_result)
+
+        if fulfillment_result == "__AWAITING_BOOK_SELECTION__":
+            deliver_assistant_response(
+                f"I found multiple matches for {pending_book_selection['query']}. Please select the correct option.",
+                intent_result,
+            )
+            return {
+                "transcript": cleaned,
+                "intent_result": intent_result,
+                "fulfillment_result": fulfillment_result,
+            }
 
         update_ui_from_intent(intent_result, fulfillment_result)
         deliver_assistant_response(fulfillment_result, intent_result)
@@ -1852,7 +2062,7 @@ def handle_live_voice_pipeline():
 
 
 def reset_pipeline_state():
-    global pipeline_control_state, ereader_state
+    global pipeline_control_state, ereader_state, pending_book_selection
 
     pipeline_control_state = {
         "current_stage": "verification",
@@ -1869,6 +2079,15 @@ def reset_pipeline_state():
         "current_page": 0,
         "reading_session": False,
         "dark_mode": False,
+    }
+
+    pending_book_selection = {
+        "active": False,
+        "intent": None,
+        "query": "",
+        "results": [],
+        "page": 0,
+        "page_size": 5,
     }
 
     clear_history()
