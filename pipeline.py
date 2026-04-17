@@ -47,10 +47,17 @@ from IPython.display import Audio
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 import asyncio
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["PATH"] = r"C:\ffmpeg;" + os.environ["PATH"]
+env_path = os.getenv("PATH")
+
+if env_path:
+    os.environ["PATH"] = env_path + ":" + os.environ["PATH"]
 
 from pathlib import Path
 from collections import defaultdict
@@ -74,8 +81,8 @@ from pydub.utils import which
 from pathlib import Path
 
 
-FFMPEG = r"C:\ffmpeg\ffmpeg.exe"
-FFPROBE = r"C:\ffmpeg\ffprobe.exe"
+FFMPEG = os.getenv("FFMPEG")
+FFPROBE = os.getenv("FFPROBE")
 
 
 AudioSegment.converter = FFMPEG
