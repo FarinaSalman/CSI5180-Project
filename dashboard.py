@@ -175,7 +175,7 @@ server_ui_state = {
     "history": initial_history,
     "timer_state": initial_timer_state,
     "reader_state": initial_reader_state,
-    "book_candidate_state": dict(initial_book_candidate_state),
+    "book_candidate_state": initial_book_candidate_state,
     "input_text": "",
 }
 
