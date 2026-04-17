@@ -24,6 +24,8 @@ app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.BOOTSTRAP],
     suppress_callback_exceptions=True,
+    title="Atlas",
+    update_title=None,
 )
 
 global server_ui_state, ui_state_lock
@@ -169,13 +171,13 @@ initial_reader_state = close_book_data()
 ui_state_lock = threading.Lock()
 
 server_ui_state = {
-    "system_state": initial_system_state,
-    "listening_state": initial_listening_state,
-    "wake_state": initial_wake_state,
-    "history": initial_history,
-    "timer_state": initial_timer_state,
-    "reader_state": initial_reader_state,
-    "book_candidate_state": initial_book_candidate_state,
+    "system_state": dict(initial_system_state),
+    "listening_state": dict(initial_listening_state),
+    "wake_state": dict(initial_wake_state),
+    "history": list(initial_history),
+    "timer_state": dict(initial_timer_state),
+    "reader_state": dict(initial_reader_state),
+    "book_candidate_state": dict(initial_book_candidate_state),
     "input_text": "",
 }
 
