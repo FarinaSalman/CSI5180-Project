@@ -108,8 +108,7 @@ The system follows a  **modular pipeline design** :
 
 ### 7. Text-to-Speech
 
-* Uses `edge_tts`
-* Playback handled via custom audio module
+* Uses `kokoro`
 
 ---
 
