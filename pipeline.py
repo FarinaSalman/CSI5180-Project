@@ -47,10 +47,18 @@ from IPython.display import Audio
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 import asyncio
+import threading
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["PATH"] = r"C:\ffmpeg;" + os.environ["PATH"]
+env_path = os.getenv("PATH")
+
+if env_path:
+    os.environ["PATH"] = env_path + ":" + os.environ["PATH"]
 
 from pathlib import Path
 from collections import defaultdict
@@ -72,10 +80,11 @@ import shutil
 import subprocess
 from pydub.utils import which
 from pathlib import Path
+from kokoro_onnx import Kokoro
+from audio_playback import play_audio, stop_playback
 
-
-FFMPEG = r"C:\ffmpeg\ffmpeg.exe"
-FFPROBE = r"C:\ffmpeg\ffprobe.exe"
+FFMPEG = os.getenv("FFMPEG")
+FFPROBE = os.getenv("FFPROBE")
 
 
 AudioSegment.converter = FFMPEG
@@ -109,9 +118,21 @@ warnings.filterwarnings(
 
 
 # Opening books from books.json
+def reset_books_db():
+    global BOOKS_DB
+    BOOKS_DB = {}
+    with open(BOOKS_PATH, "w", encoding="utf-8") as f:
+        json.dump(BOOKS_DB, f, indent=2, ensure_ascii=False)
+
 BOOKS_PATH = Path(__file__).with_name("books.json")
-with open(BOOKS_PATH, "r", encoding="utf-8") as f:
-    BOOKS_DB = json.load(f)
+
+try:
+    with open(BOOKS_PATH, "r", encoding="utf-8") as f:
+        BOOKS_DB = json.load(f)
+except Exception:
+    BOOKS_DB = {}
+
+reset_books_db()
 
 # =========================
 # Shared config and state
@@ -122,9 +143,9 @@ N_MFCC = 13
 WINDOW_SEC = 0.025
 HOP_SEC = 0.025
 
-EMBED_THRESHOLD = 0.90
-MFCC_THRESHOLD = 0.85
-FINAL_THRESHOLD = 0.89
+EMBED_THRESHOLD = 0.75
+MFCC_THRESHOLD = 0.95
+FINAL_THRESHOLD = 0.75
 EMBED_WEIGHT = 0.80
 MFCC_WEIGHT = 0.20
 
@@ -159,6 +180,15 @@ pipeline_control_state = {
     "intent_result": None,
     "fulfillment_result": None,
     "final_answer": None,
+}
+
+pending_book_selection = {
+    "active": False,
+    "intent": None,
+    "query": "",
+    "results": [],
+    "page": 0,
+    "page_size": 5,
 }
 
 # Core State Management
@@ -402,6 +432,13 @@ def verify_any_user(test_file, pin=None):
         and best_mfcc_score >= MFCC_THRESHOLD
         and best_final_score >= FINAL_THRESHOLD
     )
+    print(
+    f"Best user={best_user} | "
+    f"embed={best_embedding_score:.3f} (thr={EMBED_THRESHOLD}) | "
+    f"mfcc={best_mfcc_score:.3f} (thr={MFCC_THRESHOLD}) | "
+    f"final={best_final_score:.3f} (thr={FINAL_THRESHOLD}) | "
+    f"accepted={accepted}"
+)
 
     state_after = "Unlocked" if accepted else "Locked"
 
@@ -423,7 +460,7 @@ def verify_any_user(test_file, pin=None):
 WAKE_WORD_TEXT = "hey atlas"
 DURATION = 2.25
 NUM_SAMPLES = int(TARGET_SR * DURATION)
-WAKE_THRESHOLD = 0.70
+WAKE_THRESHOLD = 0.55
 
 def pad_or_truncate_audio(y, num_samples=NUM_SAMPLES):
     if len(y) > num_samples:
@@ -902,6 +939,195 @@ def extract_book_info(data):
       "docs": data["docs"]
   }
 
+def get_top_book_candidates(data, limit=10):
+    if data is None or "docs" not in data or len(data["docs"]) == 0:
+        return []
+
+    candidates = []
+    for doc in data["docs"][:limit]:
+        candidates.append({
+            "title": doc.get("title", "Unknown title"),
+            "author": ", ".join(doc.get("author_name", ["Unknown author"])),
+            "year": doc.get("first_publish_year", "Unknown year"),
+            "doc": doc,
+        })
+    return candidates
+
+def save_books_db():
+    global BOOKS_DB
+
+    try:
+        with open(BOOKS_PATH, "r", encoding="utf-8") as f:
+            file_books = json.load(f)
+    except Exception:
+        file_books = {}
+
+    file_books.update(BOOKS_DB)
+    BOOKS_DB = file_books
+
+    with open(BOOKS_PATH, "w", encoding="utf-8") as f:
+        json.dump(BOOKS_DB, f, indent=2, ensure_ascii=False)
+
+
+def make_lorem_pages(title: str, author: str | None = None, num_pages: int = 3):
+    author_text = f" by {author}" if author else ""
+    intro = f"{title}{author_text}\n\n"
+
+    filler = (
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
+        "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. "
+        "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. "
+        "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. "
+        "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
+    )
+
+    pages = []
+    for i in range(num_pages):
+        if i == 0:
+            page_text = intro + f"Page {i + 1}\n\n" + " ".join([filler] * 4)
+        else:
+            page_text = f"Page {i + 1}\n\n" + " ".join([filler] * 4)
+        pages.append(page_text)
+
+    return pages
+
+
+def add_book_to_local_db(title: str, author: str | None = None, series: str = "OpenLibrary"):
+    if not title:
+        return None
+
+    existing_title, existing_data = find_book_in_db(title)
+    if existing_data:
+        return existing_title
+
+    BOOKS_DB[title] = {
+        "series": series,
+        "pages": make_lorem_pages(title, author=author, num_pages=3),
+    }
+
+    save_books_db()
+    return title
+
+def get_candidate_page():
+    if not pending_book_selection["active"]:
+        return []
+
+    start = pending_book_selection["page"] * pending_book_selection["page_size"]
+    end = start + pending_book_selection["page_size"]
+    return pending_book_selection["results"][start:end]
+
+def advance_candidate_page():
+    total = len(pending_book_selection["results"])
+    page_size = pending_book_selection["page_size"]
+    next_start = (pending_book_selection["page"] + 1) * page_size
+
+    if next_start >= total:
+        return None
+
+    pending_book_selection["page"] += 1
+    return get_candidate_page()
+
+def handle_book_candidate_selection(index: int):
+    global pending_book_selection
+
+    if not pending_book_selection["active"]:
+        add_assistant_message("There is no active book selection.")
+        return
+
+    page_options = get_candidate_page()
+    if index < 0 or index >= len(page_options):
+        add_assistant_message("That book selection is invalid.")
+        return
+
+    selected = page_options[index]
+    doc = selected["doc"]
+    intent = pending_book_selection["intent"]
+    query = pending_book_selection["query"]
+
+    selected_title = doc.get("title", "Unknown title")
+    selected_authors = doc.get("author_name", ["Unknown author"])
+    selected_author = selected_authors[0] if selected_authors else "Unknown author"
+
+    if intent == "GetBook":
+        add_book_to_local_db(
+            selected_title,
+            author=selected_author,
+            series="OpenLibrary",
+        )
+
+    info = {
+        "title": selected_title,
+        "author_name": selected_authors,
+        "first_publish_year": doc.get("first_publish_year", "Unknown year"),
+        "docs": [doc],
+    }
+
+    slots = {"book_title": query}
+    response_text = generate_book_answer(intent, slots, info)
+
+    pending_book_selection = {
+        "active": False,
+        "intent": None,
+        "query": "",
+        "results": [],
+        "page": 0,
+        "page_size": 5,
+    }
+
+    clear_book_candidates()
+    deliver_assistant_response(response_text, {"intent": intent, "slots": slots})
+    transition_after_response({"intent": intent, "slots": slots})
+
+def handle_book_candidate_next_page():
+    global pending_book_selection
+
+    if not pending_book_selection["active"]:
+        add_assistant_message("There is no active book selection.")
+        return
+
+    next_page = advance_candidate_page()
+
+    if next_page is None:
+        clear_book_candidates()
+        add_assistant_message(
+            "I couldn’t find the right match. Try a more specific title or include the author."
+        )
+        pending_book_selection = {
+            "active": False,
+            "intent": None,
+            "query": "",
+            "results": [],
+            "page": 0,
+            "page_size": 5,
+        }
+        return
+
+    show_book_candidates(
+        pending_book_selection["query"],
+        next_page,
+        pending_book_selection["page"],
+        len(pending_book_selection["results"]),
+    )
+    deliver_assistant_response(
+        "Here are more matches. Please choose one.",
+        {"intent": pending_book_selection["intent"], "slots": {}},
+    )
+
+def handle_book_candidate_cancel():
+    global pending_book_selection
+
+    pending_book_selection = {
+        "active": False,
+        "intent": None,
+        "query": "",
+        "results": [],
+        "page": 0,
+        "page_size": 5,
+    }
+
+    clear_book_candidates()
+    add_assistant_message("Book selection canceled.")
+
 # Handles e-reader control actions
 def fulfill_ereader_control(intent, slots):
     if intent == "OpenBook":
@@ -972,8 +1198,17 @@ def fulfill_intent(request):
     intent = request["intent"]
     slots = request.get("slots", {})
 
-    if intent in ["Greeting", "Goodbye", "SetTimer", "SetAlarm"]:
+    if intent in ["Greeting", "Goodbye"]:
         return generate_basic_answer(intent, slots)
+    
+    elif intent in ["SetTimer", "SetAlarm"]:
+        duration_text = slots.get("duration")
+        seconds = duration_to_seconds(duration_text)
+
+        if seconds is None:
+            return "I understood that you want a timer, but I couldn’t tell the duration."
+
+        return generate_basic_answer(intent, {"duration": duration_text})
 
     elif intent == "AskForWeather":
         city = (
@@ -1015,12 +1250,24 @@ def fulfill_intent(request):
             return "Sorry, I need a book title for that request"
 
         data = call_open_library_search_api(title=book_title)
-        info = extract_book_info(data)
+        candidates = get_top_book_candidates(data, limit=10)
 
-        if info is None:
+        if not candidates:
             return "Sorry, I could not find that book."
 
-        return generate_book_answer(intent, slots, info)
+        global pending_book_selection
+        pending_book_selection = {
+            "active": True,
+            "intent": intent,
+            "query": book_title,
+            "results": candidates,
+            "page": 0,
+            "page_size": 5,
+        }
+
+        first_page = candidates[:5]
+        show_book_candidates(book_title, first_page, page=0, total=len(candidates))
+        return "__AWAITING_BOOK_SELECTION__"
 
     elif intent == "GetBooksByAuthor":
         author_name = (
@@ -1067,12 +1314,12 @@ def duration_to_seconds(duration_value):
         return None
 
     text = str(duration_value).strip().lower()
-
-    # normalize separators
     text = text.replace("-", " ")
     text = re.sub(r"\s+", " ", text).strip()
 
     word_to_num = {
+        "a": 1,
+        "an": 1,
         "one": 1,
         "two": 2,
         "three": 3,
@@ -1093,31 +1340,45 @@ def duration_to_seconds(duration_value):
         "eighteen": 18,
         "nineteen": 19,
         "twenty": 20,
+        "thirty": 30,
+        "forty": 40,
+        "fifty": 50,
+        "sixty": 60,
     }
 
-    parts = text.split()
+    if text in {"half an hour", "half hour"}:
+        return 30 * 60
 
-    if not parts:
-        return None
+    # normalize simple word numbers
+    for word, num in sorted(word_to_num.items(), key=lambda x: -len(x[0])):
+        text = re.sub(rf"\b{re.escape(word)}\b", str(num), text)
 
-    first = parts[0]
+    # handle "1 minute 30 seconds"
+    matches = re.findall(r"(\d+)\s*(hour|hours|hr|hrs|minute|minutes|min|mins|second|seconds|sec|secs)", text)
 
-    if first.isdigit():
-        number = int(first)
-    elif first in word_to_num:
-        number = word_to_num[first]
-    else:
-        return None
+    if matches:
+        total = 0
+        for value, unit in matches:
+            value = int(value)
+            if unit.startswith(("hour", "hr")):
+                total += value * 3600
+            elif unit.startswith(("minute", "min")):
+                total += value * 60
+            elif unit.startswith(("second", "sec")):
+                total += value
+        return total if total > 0 else None
 
-    # default to minutes
-    unit = parts[1] if len(parts) > 1 else "minute"
+    # fallback: bare number defaults to minutes
+    bare = re.fullmatch(r"(\d+)", text)
+    if bare:
+        return int(bare.group(1)) * 60
 
-    if unit.startswith("sec"):
-        return number
-    if unit.startswith("hour") or unit.startswith("hr"):
-        return number * 3600
+    # fallback: phrases like "for 5"
+    partial = re.search(r"\bfor\s+(\d+)\b", text)
+    if partial:
+        return int(partial.group(1)) * 60
 
-    return number * 60
+    return None
 
 def update_ui_from_intent(intent_result, fulfillment_text):
     if not intent_result:
@@ -1133,7 +1394,7 @@ def update_ui_from_intent(intent_result, fulfillment_text):
         if seconds is not None:
             start_timer(seconds)
         else:
-            start_timer()
+            return
 
     elif intent == "OpenBook":
         matched_title = ereader_state.get("current_book")
@@ -1171,9 +1432,9 @@ def generate_book_answer(intent, slots, info):
         title = info["title"]
         author = info["author_name"][0]
 
-        answer1 = f"I found {title} by {author}."
-        answer2 = f"The book I found is {title}, written by {author}."
-        answer3 = f"I found a result for that request: {title} by {author}."
+        answer1 = f"I found {title} by {author} and added it to your available books."
+        answer2 = f"The book I found is {title}, written by {author}. I also added it to your available books."
+        answer3 = f"I found a result for that request: {title} by {author}, and it is now in your available books."
         return random.choice([answer1, answer2, answer3])
 
     elif intent == "GetAuthor":
@@ -1361,51 +1622,24 @@ def generate_qwen_answer(intent, slots, max_new_tokens=256, info = None):
     return answer
 
 
+
 # =========================
-# Section 7: Text-to-Speech
+# Section 7: Text-to-Speech (Kokoro)
 # =========================
 
-async def generate_tts(text, voice="en-CA-ClaraNeural", output_file="output.mp3"):
-    communicate = edge_tts.Communicate(text=text, voice=voice)
-    await communicate.save(output_file)
-    return output_file
 
+# Load once at module level
+_kokoro_model = None
 
-async def generate_emotional_tts(
-    text,
-    strategy,
-    voice="en-CA-ClaraNeural",
-    output_file="response.mp3",
-):
-    strategy_to_prosody = {
-        "reinforce_positive": {"rate": "+12%", "pitch": "+18Hz", "volume": "+8%"},
-        "supportive": {"rate": "-18%", "pitch": "-8Hz", "volume": "-5%"},
-        "calm_down": {"rate": "-22%", "pitch": "-12Hz", "volume": "-10%"},
-        "reassuring": {"rate": "-10%", "pitch": "-5Hz", "volume": "+0%"},
-        "neutralize": {"rate": "-5%", "pitch": "-2Hz", "volume": "+0%"},
-        "informative": {"rate": "+0%", "pitch": "+0Hz", "volume": "+0%"},
-        "neutral_response": {"rate": "+0%", "pitch": "+0Hz", "volume": "+0%"},
-        "clarify_intent": {"rate": "-8%", "pitch": "+5Hz", "volume": "+0%"},
-        "gentle_probe": {"rate": "-15%", "pitch": "-3Hz", "volume": "-3%"},
-    }
-
-    prosody = strategy_to_prosody.get(strategy, strategy_to_prosody["neutral_response"])
-
-    communicate = edge_tts.Communicate(
-        text=text,
-        voice=voice,
-        rate=prosody["rate"],
-        pitch=prosody["pitch"],
-        volume=prosody["volume"],
-    )
-
-    await communicate.save(output_file)
-    return output_file
+def get_kokoro():
+    global _kokoro_model
+    if _kokoro_model is None:
+        _kokoro_model = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
+    return _kokoro_model
 
 
 def choose_tts_strategy(request):
     intent = request["intent"]
-
     if intent in ["Greeting", "Goodbye"]:
         return "reinforce_positive"
     elif intent in ["SetTimer", "SetAlarm", "OpenBook", "NextPage", "EnableDarkMode"]:
@@ -1414,41 +1648,21 @@ def choose_tts_strategy(request):
         return "informative"
     elif intent == "OOS":
         return "neutralize"
-
     return "neutral_response"
 
 
-async def speak_generated_answer(
-    request,
-    answer_source="template",
-    voice="en-CA-ClaraNeural",
-    output_file="assistant_response.mp3",
-):
-    if answer_source == "template":
-        response_text = fulfill_intent(request)
-    elif answer_source == "qwen":
-        response_text = generate_qwen_answer(request)
-    else:
-        raise ValueError("answer_source must be 'template' or 'qwen'")
-
-    strategy = choose_tts_strategy(request)
-
-    audio_file = await generate_emotional_tts(
-        text=response_text,
-        strategy=strategy,
-        voice=voice,
-        output_file=output_file,
-    )
-
-    return {
-        "request": request,
-        "response_text": response_text,
-        "strategy": strategy,
-        "audio_file": audio_file,
-    }
-
-
-from audio_playback import play_audio
+# Maps strategy to Kokoro speed
+STRATEGY_TO_SPEED = {
+    "reinforce_positive": 1.2,
+    "supportive":         0.85,
+    "calm_down":          0.8,
+    "reassuring":         0.92,
+    "neutralize":         0.95,
+    "informative":        1.0,
+    "neutral_response":   1.0,
+    "clarify_intent":     0.95,
+    "gentle_probe":       0.88,
+}
 
 
 def speak_text_response(response_text: str, intent_result: dict | None = None):
@@ -1457,24 +1671,62 @@ def speak_text_response(response_text: str, intent_result: dict | None = None):
 
     request = intent_result or {"intent": "OOS", "slots": {}}
     strategy = choose_tts_strategy(request)
-    output_file = "assistant_response.mp3"
+    speed = STRATEGY_TO_SPEED.get(strategy, 1.0)
+    # output_file = "assistant_response.wav"
 
-    asyncio.run(
-        generate_emotional_tts(
-            text=response_text,
-            strategy=strategy,
-            voice="en-CA-ClaraNeural",
-            output_file=output_file,
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    output_file = tmp.name
+    tmp.close()
+
+    print(f"DEBUG: TTS generating for strategy={strategy}, speed={speed}")
+
+    try:
+        kokoro = get_kokoro()
+        samples, sample_rate = kokoro.create(
+            response_text,
+            voice="af_bella",   # change voice here if desired
+            speed=speed,
+            lang="en-us",
         )
-    )
 
-    play_audio(output_file, wait=True)
+        sf.write(output_file, samples, sample_rate)
+        print("DEBUG: TTS generation complete.")
+
+    except Exception as e:
+        import traceback
+        print(f"DEBUG: TTS generation error: {e}")
+        traceback.print_exc()
+        return None
+
+    print("DEBUG: Starting audio playback...")
+    try:
+        stop_playback()
+        play_audio(output_file, wait=False)
+        print("DEBUG: Audio playback complete.")
+    except Exception as e:
+        import traceback
+        print(f"DEBUG: Audio playback error: {e}")
+        traceback.print_exc()
+    
     return output_file
 
 
 def deliver_assistant_response(response_text: str, intent_result: dict | None = None):
+    print("DEBUG: before add_assistant_message inside deliver_assistant_response")
     add_assistant_message(response_text)
-    speak_text_response(response_text, intent_result)
+    print("DEBUG: after add_assistant_message inside deliver_assistant_response")
+
+    def _tts_worker():
+        try:
+            print("DEBUG: before speak_text_response inside tts worker")
+            speak_text_response(response_text, intent_result)
+            print("DEBUG: after speak_text_response inside tts worker")
+        except Exception as e:
+            import traceback
+            print(f"DEBUG: TTS worker error: {e}")
+            traceback.print_exc()
+
+    threading.Thread(target=_tts_worker, daemon=True).start()
 
     
 # =========================
@@ -1504,6 +1756,10 @@ from ui_bridge import (
     decrease_brightness,
     toggle_reader_theme,
     set_input_text,
+    show_book_candidates,
+    clear_book_candidates,
+    select_book_candidate,
+    next_book_candidate_page,
 )
 
 def transition_after_response(intent_result: dict | None):
@@ -1516,8 +1772,12 @@ def transition_after_response(intent_result: dict | None):
         return
 
     pipeline_control_state["current_stage"] = "asr"
-    pipeline_control_state["wakeword_passed"] = True
+    pipeline_control_state["transcript"] = ""        # clear old transcript
+    pipeline_control_state["intent_result"] = None   # clear old intent
+    pipeline_control_state["fulfillment_result"] = None  # clear old result
+
     set_awake(True)
+    set_listening(False)   # make sure listening indicator resets
 
 
 from listen_and_transcribe import listen_until_silence
@@ -1525,6 +1785,22 @@ from listen_and_transcribe import listen_until_silence
 # Ensures that Input is being done in order
 def handle_text_bypass_input(text: str):
     global pipeline_control_state
+
+    if text.startswith("__select_candidate__:"):
+        try:
+            idx = int(text.split(":")[-1])
+            handle_book_candidate_selection(idx)
+        except ValueError:
+            add_assistant_message("Invalid book selection.")
+        return
+
+    if text == "__next_candidate_page__":
+        handle_book_candidate_next_page()
+        return
+
+    if text == "__cancel_candidate_selection__":
+        handle_book_candidate_cancel()
+        return
 
     text = (text or "").strip()
     if not text:
@@ -1538,7 +1814,7 @@ def handle_text_bypass_input(text: str):
         handle_verification_bypass(text)
     elif stage == "wakeword":
         handle_wakeword_bypass(text)
-    elif stage == "asr":
+    elif stage in ["asr", "awaiting_asr_confirmation"]:
         handle_asr_bypass(text)
     elif stage == "intent":
         handle_intent_bypass(text)
@@ -1628,23 +1904,29 @@ def handle_asr_bypass(text: str):
 
     fulfillment_result = fulfill_intent(intent_result)
     pipeline_control_state["fulfillment_result"] = fulfillment_result
-
+    if fulfillment_result == "__AWAITING_BOOK_SELECTION__":
+        deliver_assistant_response(
+            f"I found multiple matches for {pending_book_selection['query']}. Please select the correct option.",
+            intent_result,
+        )
+        return
     update_ui_from_intent(intent_result, fulfillment_result)
 
     # special case: goodbye should reset immediately after responding
     if intent_result.get("intent") == "Goodbye":
-        add_assistant_message(fulfillment_result)
-
-        try:
-            speak_text_response(fulfillment_result, intent_result)
-        except Exception as e:
-            print(f"TTS/playback error during goodbye: {e}")
-
+        deliver_assistant_response(fulfillment_result, intent_result)
         reset_pipeline_state()
         return
     
     deliver_assistant_response(fulfillment_result, intent_result)
-    transition_after_response(intent_result)
+    # set_input_text("")
+    def _delayed_transition():
+        import time
+        time.sleep(0.15)
+        transition_after_response(intent_result)
+
+    threading.Thread(target=_delayed_transition, daemon=True).start()
+    
 
 
 def handle_intent_bypass(text: str):
@@ -1712,6 +1994,17 @@ def handle_text_command(text: str):
         )
 
         fulfillment_result = fulfill_intent(intent_result)
+
+        if fulfillment_result == "__AWAITING_BOOK_SELECTION__":
+            deliver_assistant_response(
+                f"I found multiple matches for {pending_book_selection['query']}. Please select the correct option.",
+                intent_result,
+            )
+            return {
+                "transcript": cleaned,
+                "intent_result": intent_result,
+                "fulfillment_result": fulfillment_result,
+            }
 
         update_ui_from_intent(intent_result, fulfillment_result)
         deliver_assistant_response(fulfillment_result, intent_result)
@@ -1837,10 +2130,11 @@ def handle_live_voice_pipeline():
                 "wakeword_result": wakeword_result,
             }
 
-         # -------------------------
+        # -------------------------
         # STAGE 3: command speech
         # Intent, fulfillment, answer all happen automatically here
         # -------------------------
+
         elif stage == "asr":
             asr_wav = clone_temp_wav(temp_wav_path)
             transcript, _ = transcribe_audio_file(asr_wav, asr_model)
@@ -1852,64 +2146,24 @@ def handle_live_voice_pipeline():
                 set_awake(True)
                 return None
 
+            transcript = transcript.strip()
             pipeline_control_state["transcript"] = transcript
-            add_user_message(transcript)
 
-            intent_result = predict_from_text(
-                transcript,
-                intent_model,
-                intent_tokenizer,
-                id2intent,
-                id2slot,
-                device,
+            # put transcript into the dashboard text area for review
+            set_input_text(transcript)
+
+            # move to a separate waiting stage
+            pipeline_control_state["current_stage"] = "awaiting_asr_confirmation"
+            pipeline_control_state["wakeword_passed"] = True
+            set_awake(True)
+
+            add_assistant_message(
+                "I transcribed your speech. Please review or edit it in the text box, then press Submit."
             )
-
-            def fallback_book_intent(transcript: str):
-                text = (transcript or "").strip().lower()
-
-                for title in BOOKS_DB.keys():
-                    if title.lower() in text:
-                        return {
-                            "intent": "OpenBook",
-                            "confidence": 0.99,
-                            "slots": {"title": title},
-                        }
-
-                return None
-            
-            if not intent_result or intent_result.get("intent") == "OOS":
-                fallback_result = fallback_book_intent(transcript)
-                if fallback_result:
-                    intent_result = fallback_result
-            print("INTENT RESULT:", intent_result)
-            pipeline_control_state["intent_result"] = intent_result
-
-            # if intent is missing / unclear / OOS, ask again and stay in ASR
-            if not intent_result or not intent_result.get("intent") or intent_result.get("intent") == "OOS":
-                add_assistant_message("I didn’t catch what you were saying. Please say that again.")
-                pipeline_control_state["current_stage"] = "asr"
-                pipeline_control_state["wakeword_passed"] = True
-                set_awake(True)
-                return {
-                    "stage": "asr_retry",
-                    "transcript": transcript,
-                    "intent_result": intent_result,
-                }
-
-            fulfillment_result = fulfill_intent(intent_result)
-            pipeline_control_state["fulfillment_result"] = fulfillment_result
-
-            update_ui_from_intent(intent_result, fulfillment_result)
-            transition_after_response(intent_result)
-            deliver_assistant_response(fulfillment_result, intent_result)
-
-            
 
             return {
                 "stage": "asr",
                 "transcript": transcript,
-                "intent_result": intent_result,
-                "fulfillment_result": fulfillment_result,
             }
 
         else:
@@ -1945,7 +2199,7 @@ def handle_live_voice_pipeline():
 
 
 def reset_pipeline_state():
-    global pipeline_control_state, ereader_state
+    global pipeline_control_state, ereader_state, pending_book_selection
 
     pipeline_control_state = {
         "current_stage": "verification",
@@ -1962,6 +2216,15 @@ def reset_pipeline_state():
         "current_page": 0,
         "reading_session": False,
         "dark_mode": False,
+    }
+
+    pending_book_selection = {
+        "active": False,
+        "intent": None,
+        "query": "",
+        "results": [],
+        "page": 0,
+        "page_size": 5,
     }
 
     clear_history()
@@ -2090,8 +2353,16 @@ wake_model.load_weights("saved_intent_model/wake_model.weights.h5")
 # # =========================
 
 def find_book_in_db(requested_title: str):
+    global BOOKS_DB
+
     if not requested_title:
         return None, None
+
+    try:
+        with open(BOOKS_PATH, "r", encoding="utf-8") as f:
+            BOOKS_DB = json.load(f)
+    except Exception:
+        BOOKS_DB = {}
 
     requested_title = requested_title.strip().lower()
 

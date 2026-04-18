@@ -15,11 +15,20 @@ from pipeline import (
     reset_pipeline_state,
 )
 
+
 BOOKS_PATH = Path(__file__).with_name("books.json")
 with open(BOOKS_PATH, "r", encoding="utf-8") as f:
     BOOKS_DB = json.load(f)
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.BOOTSTRAP],
+    suppress_callback_exceptions=True,
+    title="Atlas",
+    update_title=None,
+)
+
+global server_ui_state, ui_state_lock
 
 
 def send_text_to_pipeline(text: str):
@@ -50,14 +59,16 @@ def add_history_message(history: list, role: str, text: str):
 
 def start_timer_data(timer_data: dict, duration: int | None = None):
     timer_data = dict(timer_data or {})
-    if duration is not None:
-        timer_data["duration"] = duration
-        timer_data["elapsed"] = 0
 
-    now = time.time()
+    if duration is None or duration <= 0:
+        timer_data["status"] = "stopped"
+        timer_data["start_time"] = None
+        return timer_data
+
+    timer_data["duration"] = duration
+    timer_data["elapsed"] = 0
     timer_data["status"] = "running"
-    timer_data["start_time"] = now
-
+    timer_data["start_time"] = time.time()
     return timer_data
 
 
@@ -136,6 +147,13 @@ def close_book_data(current_state: dict | None = None):
         "dark_mode": current_state.get("dark_mode", False),
     }
 
+def load_books_db():
+    try:
+        with open(BOOKS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
 
 initial_system_state = {"locked": True}
 initial_listening_state = {"listening": False}
@@ -147,7 +165,28 @@ initial_timer_state = {
     "duration": 0,
     "start_time": None,
 }
+initial_book_candidate_state = {
+    "active": False,
+    "query": "",
+    "options": [],
+    "page": 0,
+    "total": 0,
+}
 initial_reader_state = close_book_data()
+
+
+ui_state_lock = threading.Lock()
+
+server_ui_state = {
+    "system_state": dict(initial_system_state),
+    "listening_state": dict(initial_listening_state),
+    "wake_state": dict(initial_wake_state),
+    "history": list(initial_history),
+    "timer_state": dict(initial_timer_state),
+    "reader_state": dict(initial_reader_state),
+    "book_candidate_state": dict(initial_book_candidate_state),
+    "input_text": "",
+}
 
 app.layout = html.Div(
     className="bg-light",
@@ -164,7 +203,18 @@ app.layout = html.Div(
         
 
         dcc.Interval(id="timer-interval", interval=1000, n_intervals=0),
-        dcc.Interval(id="bridge-poll", interval=250, n_intervals=0),
+        dcc.Interval(id="bridge-poll", interval=100, n_intervals=0),
+
+        dcc.Store(
+            id="book-candidate-state",
+            data={
+                "active": False,
+                "query": "",
+                "options": [],
+                "page": 0,
+                "total": 0,
+            },
+        ),
 
         html.Div(
             className="container-fluid py-4",
@@ -305,6 +355,32 @@ app.layout = html.Div(
                     ],
                 ),
                 html.Div(
+                    className="row g-4 mb-4",
+                    children=[
+                        html.Div(
+                            className="col-12",
+                            children=[
+                                html.Div(
+                                    className="card shadow-sm border-0",
+                                    children=[
+                                        html.Div(
+                                            className="card-body",
+                                            children=[
+                                                html.H4("Book Search Matches", className="mb-3"),
+                                                html.Div(
+                                                    id="book-candidate-panel",
+                                                    className="text-muted",
+                                                    children="No book disambiguation needed",
+                                                ),
+                                            ],
+                                        )
+                                    ],
+                                )
+                            ],
+                        )
+                    ],
+                ),
+                html.Div(
                     className="row",
                     children=[
                         html.Div(
@@ -420,12 +496,168 @@ def render_wake_badge(wake_state):
         return "AWAKE", "badge text-bg-info fs-6 px-3 py-2"
     return "ASLEEP", "badge text-bg-dark fs-6 px-3 py-2"
 
+@app.callback(
+    Output("book-candidate-panel", "children"),
+    Input("book-candidate-state", "data"),
+)
+def render_book_candidate_panel(candidate_state):
+    candidate_state = candidate_state or {}
+    active = candidate_state.get("active", False)
+
+    if not active:
+        return html.Div(
+            "No book disambiguation needed",
+            className="text-muted",
+        )
+
+    query = candidate_state.get("query", "")
+    options = candidate_state.get("options", [])
+    page = candidate_state.get("page", 0)
+    total = candidate_state.get("total", 0)
+
+    if not options:
+        return html.Div(
+            "No candidate options available",
+            className="text-muted",
+        )
+
+    children = [
+        html.P(
+            f"I found multiple matches for '{query}'. Please choose one.",
+            className="mb-3",
+        )
+    ]
+
+    start_number = page * 5 + 1
+
+    for i, option in enumerate(options):
+        title = option.get("title", "Unknown title")
+        author = option.get("author", "Unknown author")
+        year = option.get("year", "Unknown year")
+
+        children.append(
+            html.Button(
+                f"{start_number + i}. {title} — {author} — {year}",
+                id={"type": "candidate-select", "index": i},
+                n_clicks=0,
+                className="btn btn-outline-primary w-100 text-start mb-2",
+            )
+        )
+
+    controls = [
+        html.Button(
+            "None of these — Show more",
+            id="candidate-next-page",
+            n_clicks=0,
+            className="btn btn-outline-secondary me-2",
+        ),
+        html.Button(
+            "Cancel",
+            id="candidate-cancel",
+            n_clicks=0,
+            className="btn btn-outline-danger",
+        ),
+    ]
+
+    children.append(html.Div(controls, className="mt-3"))
+    children.append(
+        html.Div(
+            f"Showing page {page + 1} of {max(1, (total + 4) // 5)}",
+            className="text-muted mt-2",
+        )
+    )
+
+    return children
 
 @app.callback(
-    Output("output-history", "children"),
-    Input("history-state", "data"),
+    Output("input-text", "value", allow_duplicate=True),
+    Input({"type": "candidate-select", "index": ALL}, "n_clicks"),
+    Input("candidate-next-page", "n_clicks"),
+    Input("candidate-cancel", "n_clicks"),
+    State("book-candidate-state", "data"),
+    prevent_initial_call=True,
 )
-def render_output_history(history):
+def handle_book_candidate_actions(candidate_clicks, next_page_clicks, cancel_clicks, candidate_state):
+    candidate_state = candidate_state or {}
+    if not candidate_state.get("active", False):
+        return no_update
+    
+    triggered = ctx.triggered_id
+
+    if triggered is None:
+        return no_update
+
+    # Candidate button clicked
+    if isinstance(triggered, dict) and triggered.get("type") == "candidate-select":
+        idx = triggered["index"]
+
+        if not candidate_clicks:
+            return no_update
+
+        if idx >= len(candidate_clicks):
+            return no_update
+
+        if not candidate_clicks[idx]:
+            return no_update
+
+        send_text_to_pipeline(f"__select_candidate__:{idx}")
+        return ""
+
+    # Next page clicked
+    if triggered == "candidate-next-page":
+        if not next_page_clicks:
+            return no_update
+
+        send_text_to_pipeline("__next_candidate_page__")
+        return ""
+
+    # Cancel clicked
+    if triggered == "candidate-cancel":
+        if not cancel_clicks:
+            return no_update
+
+        send_text_to_pipeline("__cancel_candidate_selection__")
+        return ""
+
+    return no_update
+
+# @app.callback(
+#     Output("output-history", "children"),
+#     Input("history-state", "data"),
+# )
+# def render_output_history(history):
+#     history = history or []
+
+#     if len(history) == 0:
+#         return html.Div(
+#             className="h-100 d-flex justify-content-center align-items-center text-muted",
+#             children="No history yet",
+#         )
+
+#     items = []
+#     for msg in history:
+#         role = msg.get("role", "").lower()
+#         text = msg.get("text", "")
+
+#         if role == "user":
+#             role_label = html.Div("User", className="fw-semibold text-primary")
+#         else:
+#             role_label = html.Div("Assistant", className="fw-semibold text-success")
+
+#         items.append(
+#             html.Div(
+#                 className="mb-3",
+#                 children=[
+#                     role_label,
+#                     html.Div(text, className="mb-2"),
+#                 ],
+#             )
+#         )
+
+#     return items
+
+
+def build_output_history_children(history):
     history = history or []
 
     if len(history) == 0:
@@ -460,15 +692,24 @@ def render_output_history(history):
 @app.callback(
     Output("book-list", "children"),
     Input("reader-state", "data"),
+    Input("history-state", "data"),
 )
-def render_book_list(reader_state):
+def render_book_list(reader_state, _history_state):
     reader_state = reader_state or close_book_data()
     current_title = reader_state.get("title", "")
     is_open = reader_state.get("is_open", False)
 
-    items = []
+    try:
+        with open(BOOKS_PATH, "r", encoding="utf-8") as f:
+            books_db = json.load(f)
+    except Exception:
+        books_db = {}
 
-    for title in sorted(BOOKS_DB.keys()):
+    if not books_db:
+        return html.Div("No books loaded", className="text-muted")
+
+    items = []
+    for title in sorted(books_db.keys()):
         active = is_open and title == current_title
         items.append(
             html.Button(
@@ -596,6 +837,11 @@ def handle_submit(_n_clicks, input_text):
         return ""
 
     cleaned = input_text.strip()
+
+    with ui_state_lock:
+        server_ui_state["input_text"] = ""
+
+
     send_text_to_pipeline(cleaned)
     return ""
 
@@ -634,10 +880,14 @@ def update_reader_state(
             return no_update
 
         title = triggered["title"]
-        book = BOOKS_DB[title]
+        books_db = load_books_db()
+        book = books_db.get(title)
+        if not book:
+            return no_update
+
         return open_book_data(
             title,
-            book["pages"],
+            book.get("pages", []),
             page_index=0,
             current_state=reader_state,
         )
@@ -673,133 +923,187 @@ def update_reader_state(
     Output("history-state", "data"),
     Output("timer-state", "data"),
     Output("reader-state", "data"),
+    Output("input-text", "value", allow_duplicate=True),
+    Output("output-history", "children"),
+    Output("book-candidate-state", "data"),
     Input("bridge-poll", "n_intervals"),
-    State("system-state", "data"),
-    State("listening-state", "data"),
-    State("wake-state", "data"),
-    State("history-state", "data"),
-    State("timer-state", "data"),
-    State("reader-state", "data"),
+    prevent_initial_call=True,
 )
-def process_bridge_events(
-    _n_intervals,
-    system_state,
-    listening_state,
-    wake_state,
-    history,
-    timer_state,
-    reader_state,
-):
+def process_bridge_events(_n_intervals):
     updated = False
 
-    while True:
-        try:
-            event = ui_queue.get_nowait()
-        except Empty:
-            break
+    with ui_state_lock:
+        while True:
+            try:
+                event = ui_queue.get_nowait()
+            except Empty:
+                break
 
-        event_type = event.get("type")
-        payload = event.get("payload") or {}
+            event_type = event.get("type")
+            payload = event.get("payload") or {}
 
-        if event_type == "set_locked":
-            system_state = set_system_locked_data(payload.get("locked", False))
-            updated = True
-
-        elif event_type == "set_listening":
-            listening_state = set_listening_data(payload.get("listening", False))
-            updated = True
-
-        elif event_type == "set_awake":
-            wake_state = set_wake_state_data(payload.get("awake", False))
-            updated = True
-
-        elif event_type == "add_user_message":
-            history = add_history_message(history, "user", payload.get("text", ""))
-            updated = True
-
-        elif event_type == "add_assistant_message":
-            history = add_history_message(history, "assistant", payload.get("text", ""))
-            updated = True
-
-        elif event_type == "clear_history":
-            history = []
-            updated = True
-
-        elif event_type == "start_timer":
-            duration = payload.get("duration")
-            timer_state = start_timer_data(timer_state, duration)
-            updated = True
-
-        elif event_type == "pause_timer":
-            timer_state = pause_timer_data(timer_state)
-            updated = True
-
-        elif event_type == "stop_timer":
-            timer_state = stop_timer_data(timer_state)
-            updated = True
-
-        elif event_type == "reset_timer":
-            timer_state = reset_timer_data(timer_state)
-            updated = True
-
-        elif event_type == "open_book":
-            title = payload.get("title", "Untitled")
-
-            if title in BOOKS_DB:
-                reader_state = open_book_data(
-                    title,
-                    BOOKS_DB[title]["pages"],
-                    page_index=payload.get("page_index", 0),
-                    current_state=reader_state,
-                )
-            else:
-                reader_state = open_book_data(
-                    title,
-                    payload.get("pages", []) or [payload.get("content", "")],
-                    page_index=payload.get("page_index", 0),
-                    current_state=reader_state,
-                )
-            updated = True
-
-        elif event_type == "close_book":
-            reader_state = close_book_data(reader_state)
-            updated = True
-
-        elif event_type == "next_page":
-            if reader_state.get("is_open") and reader_state.get("pages"):
-                last_page = len(reader_state["pages"]) - 1
-                reader_state["page_index"] = min(last_page, reader_state["page_index"] + 1)
+            if event_type == "set_locked":
+                server_ui_state["system_state"] = set_system_locked_data(payload.get("locked", False))
                 updated = True
 
-        elif event_type == "prev_page":
-            if reader_state.get("is_open") and reader_state.get("pages"):
-                reader_state["page_index"] = max(0, reader_state["page_index"] - 1)
+            elif event_type == "set_listening":
+                server_ui_state["listening_state"] = set_listening_data(payload.get("listening", False))
                 updated = True
 
-        elif event_type == "increase_font_size":
-            reader_state["font_size"] = min(36, reader_state.get("font_size", 18) + 2)
-            updated = True
+            elif event_type == "set_awake":
+                server_ui_state["wake_state"] = set_wake_state_data(payload.get("awake", False))
+                updated = True
 
-        elif event_type == "decrease_font_size":
-            reader_state["font_size"] = max(12, reader_state.get("font_size", 18) - 2)
-            updated = True
+            elif event_type == "add_user_message":
+                server_ui_state["history"] = add_history_message(
+                    server_ui_state["history"], "user", payload.get("text", "")
+                )
+                updated = True
 
-        elif event_type == "increase_brightness":
-            reader_state["brightness"] = min(140, reader_state.get("brightness", 100) + 10)
-            updated = True
+            elif event_type == "add_assistant_message":
+                server_ui_state["history"] = add_history_message(
+                    server_ui_state["history"], "assistant", payload.get("text", "")
+                )
+                updated = True
 
-        elif event_type == "decrease_brightness":
-            reader_state["brightness"] = max(40, reader_state.get("brightness", 100) - 10)
-            updated = True
+            elif event_type == "clear_history":
+                server_ui_state["history"] = []
+                updated = True
 
-        elif event_type == "toggle_reader_theme":
-            reader_state["dark_mode"] = not reader_state.get("dark_mode", False)
-            updated = True
+            elif event_type == "start_timer":
+                duration = payload.get("duration")
+                server_ui_state["timer_state"] = start_timer_data(server_ui_state["timer_state"], duration)
+                updated = True
 
-    if not updated:
-        return no_update, no_update, no_update, no_update, no_update, no_update
+            elif event_type == "pause_timer":
+                server_ui_state["timer_state"] = pause_timer_data(server_ui_state["timer_state"])
+                updated = True
 
-    return system_state, listening_state, wake_state, history, timer_state, reader_state
+            elif event_type == "stop_timer":
+                server_ui_state["timer_state"] = stop_timer_data(server_ui_state["timer_state"])
+                updated = True
+
+            elif event_type == "reset_timer":
+                server_ui_state["timer_state"] = reset_timer_data(server_ui_state["timer_state"])
+                updated = True
+
+            elif event_type == "open_book":
+                title = payload.get("title", "Untitled")
+                if title in BOOKS_DB:
+                    server_ui_state["reader_state"] = open_book_data(
+                        title,
+                        BOOKS_DB[title]["pages"],
+                        page_index=payload.get("page_index", 0),
+                        current_state=server_ui_state["reader_state"],
+                    )
+                else:
+                    server_ui_state["reader_state"] = open_book_data(
+                        title,
+                        payload.get("pages", []) or [payload.get("content", "")],
+                        page_index=payload.get("page_index", 0),
+                        current_state=server_ui_state["reader_state"],
+                    )
+                updated = True
+
+            elif event_type == "close_book":
+                server_ui_state["reader_state"] = close_book_data(server_ui_state["reader_state"])
+                updated = True
+
+            elif event_type == "next_page":
+                reader_state = dict(server_ui_state["reader_state"])
+                if reader_state.get("is_open") and reader_state.get("pages"):
+                    last_page = len(reader_state["pages"]) - 1
+                    reader_state["page_index"] = min(last_page, reader_state["page_index"] + 1)
+                    server_ui_state["reader_state"] = reader_state
+                    updated = True
+
+            elif event_type == "prev_page":
+                reader_state = dict(server_ui_state["reader_state"])
+                if reader_state.get("is_open") and reader_state.get("pages"):
+                    reader_state["page_index"] = max(0, reader_state["page_index"] - 1)
+                    server_ui_state["reader_state"] = reader_state
+                    updated = True
+
+            elif event_type == "increase_font_size":
+                reader_state = dict(server_ui_state["reader_state"])
+                reader_state["font_size"] = min(36, reader_state.get("font_size", 18) + 2)
+                server_ui_state["reader_state"] = reader_state
+                updated = True
+
+            elif event_type == "decrease_font_size":
+                reader_state = dict(server_ui_state["reader_state"])
+                reader_state["font_size"] = max(12, reader_state.get("font_size", 18) - 2)
+                server_ui_state["reader_state"] = reader_state
+                updated = True
+
+            elif event_type == "increase_brightness":
+                reader_state = dict(server_ui_state["reader_state"])
+                reader_state["brightness"] = min(140, reader_state.get("brightness", 100) + 10)
+                server_ui_state["reader_state"] = reader_state
+                updated = True
+
+            elif event_type == "decrease_brightness":
+                reader_state = dict(server_ui_state["reader_state"])
+                reader_state["brightness"] = max(40, reader_state.get("brightness", 100) - 10)
+                server_ui_state["reader_state"] = reader_state
+                updated = True
+
+            elif event_type == "toggle_reader_theme":
+                reader_state = dict(server_ui_state["reader_state"])
+                reader_state["dark_mode"] = not reader_state.get("dark_mode", False)
+                server_ui_state["reader_state"] = reader_state
+                updated = True
+
+            elif event_type == "set_input_text":
+                server_ui_state["input_text"] = payload.get("text", "")
+                updated = True
+
+            elif event_type == "show_book_candidates":
+                server_ui_state["book_candidate_state"] = {
+                    "active": True,
+                    "query": payload.get("query", ""),
+                    "options": payload.get("options", []),
+                    "page": payload.get("page", 0),
+                    "total": payload.get("total", 0),
+                }
+                updated = True
+
+            elif event_type == "clear_book_candidates":
+                server_ui_state["book_candidate_state"] = {
+                    "active": False,
+                    "query": "",
+                    "options": [],
+                    "page": 0,
+                    "total": 0,
+                }
+                updated = True
+
+        if not updated:
+            return (
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+                no_update,
+            )
+
+        history_copy = list(server_ui_state["history"])
+
+        return (
+            dict(server_ui_state["system_state"]),
+            dict(server_ui_state["listening_state"]),
+            dict(server_ui_state["wake_state"]),
+            history_copy,
+            dict(server_ui_state["timer_state"]),
+            dict(server_ui_state["reader_state"]),
+            server_ui_state["input_text"],
+            build_output_history_children(history_copy),
+            dict(server_ui_state["book_candidate_state"]),
+        )
 
 
 if __name__ == "__main__":

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import os
+import platform
+import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
-import simpleaudio as sa
-
-FFMPEG_EXE = r"C:\ffmpeg\ffmpeg.exe"
+_current_process: subprocess.Popen | None = None
 
 
 def validate_audio_file(file_path: str | os.PathLike) -> Path:
@@ -25,87 +24,79 @@ def validate_audio_file(file_path: str | os.PathLike) -> Path:
     return path
 
 
-def convert_mp3_to_temp_wav(mp3_path: Path) -> str:
-    ffmpeg = Path(FFMPEG_EXE)
-    if not ffmpeg.exists():
-        raise FileNotFoundError(f"ffmpeg not found: {ffmpeg}")
+def _play_with_subprocess(command: list[str], wait: bool) -> None:
+    global _current_process
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        temp_wav = tmp.name
-
-    cmd = [
-        str(ffmpeg),
-        "-y",
-        "-i",
-        str(mp3_path),
-        temp_wav,
-    ]
-
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    if result.returncode != 0:
-        if os.path.exists(temp_wav):
-            os.remove(temp_wav)
-        raise RuntimeError(f"ffmpeg conversion failed:\n{result.stderr}")
-
-    return temp_wav
+    if wait:
+        subprocess.run(command, check=True)
+        _current_process = None
+    else:
+        _current_process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 def play_audio(file_path: str | os.PathLike, wait: bool = True):
     path = validate_audio_file(file_path)
+    system = platform.system()
 
-    if path.suffix.lower() == ".wav":
-        wave_obj = sa.WaveObject.from_wave_file(str(path))
-        play_obj = wave_obj.play()
-        if wait:
-            play_obj.wait_done()
-        return play_obj
-
-    temp_wav = convert_mp3_to_temp_wav(path)
-
-    try:
-        wave_obj = sa.WaveObject.from_wave_file(temp_wav)
-        play_obj = wave_obj.play()
+    if system == "Windows":
+        import winsound
 
         if wait:
-            play_obj.wait_done()
-            if os.path.exists(temp_wav):
-                os.remove(temp_wav)
+            winsound.PlaySound(str(path), winsound.SND_FILENAME)
+        else:
+            winsound.PlaySound(
+                str(path),
+                winsound.SND_FILENAME | winsound.SND_ASYNC,
+            )
+        return str(path)
 
-        return play_obj, temp_wav
-    except Exception:
-        if os.path.exists(temp_wav):
-            os.remove(temp_wav)
-        raise
+    if system == "Darwin":
+        # macOS built-in player
+        _play_with_subprocess(["afplay", str(path)], wait)
+        return str(path)
+
+    # Linux / fallback
+    if shutil.which("ffplay"):
+        _play_with_subprocess(
+            ["ffplay", "-nodisp", "-autoexit", str(path)],
+            wait,
+        )
+        return str(path)
+
+    raise RuntimeError(
+        "No supported audio playback method found. "
+        "On macOS, afplay should exist. On Linux, install ffmpeg/ffplay."
+    )
 
 
-def stop_playback(play_result) -> None:
-    if play_result is None:
+def stop_playback(play_result=None) -> None:
+    global _current_process
+    system = platform.system()
+
+    if system == "Windows":
+        import winsound
+        winsound.PlaySound(None, 0)
         return
 
-    if isinstance(play_result, tuple):
-        play_obj, temp_wav = play_result
-    else:
-        play_obj, temp_wav = play_result, None
-
-    play_obj.stop()
-
-    if temp_wav and os.path.exists(temp_wav):
-        os.remove(temp_wav)
+    if _current_process is not None:
+        try:
+            _current_process.terminate()
+        except Exception:
+            pass
+        _current_process = None
 
 
 if __name__ == "__main__":
-    sample_file = "assistant_response.mp3"
+    sample_file = "assistant_response.wav"
 
     try:
         print("Testing file:", Path(sample_file).resolve())
         print("Exists:", Path(sample_file).exists())
-        print("ffmpeg exists:", Path(FFMPEG_EXE).exists())
+        print("Platform:", platform.system())
         play_audio(sample_file, wait=True)
         print("Playback finished.")
     except Exception as e:
