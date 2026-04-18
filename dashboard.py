@@ -147,6 +147,13 @@ def close_book_data(current_state: dict | None = None):
         "dark_mode": current_state.get("dark_mode", False),
     }
 
+def load_books_db():
+    try:
+        with open(BOOKS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
 
 initial_system_state = {"locked": True}
 initial_listening_state = {"listening": False}
@@ -685,15 +692,24 @@ def build_output_history_children(history):
 @app.callback(
     Output("book-list", "children"),
     Input("reader-state", "data"),
+    Input("history-state", "data"),
 )
-def render_book_list(reader_state):
+def render_book_list(reader_state, _history_state):
     reader_state = reader_state or close_book_data()
     current_title = reader_state.get("title", "")
     is_open = reader_state.get("is_open", False)
 
-    items = []
+    try:
+        with open(BOOKS_PATH, "r", encoding="utf-8") as f:
+            books_db = json.load(f)
+    except Exception:
+        books_db = {}
 
-    for title in sorted(BOOKS_DB.keys()):
+    if not books_db:
+        return html.Div("No books loaded", className="text-muted")
+
+    items = []
+    for title in sorted(books_db.keys()):
         active = is_open and title == current_title
         items.append(
             html.Button(
@@ -864,10 +880,14 @@ def update_reader_state(
             return no_update
 
         title = triggered["title"]
-        book = BOOKS_DB[title]
+        books_db = load_books_db()
+        book = books_db.get(title)
+        if not book:
+            return no_update
+
         return open_book_data(
             title,
-            book["pages"],
+            book.get("pages", []),
             page_index=0,
             current_state=reader_state,
         )

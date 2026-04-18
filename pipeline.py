@@ -118,9 +118,21 @@ warnings.filterwarnings(
 
 
 # Opening books from books.json
+def reset_books_db():
+    global BOOKS_DB
+    BOOKS_DB = {}
+    with open(BOOKS_PATH, "w", encoding="utf-8") as f:
+        json.dump(BOOKS_DB, f, indent=2, ensure_ascii=False)
+
 BOOKS_PATH = Path(__file__).with_name("books.json")
-with open(BOOKS_PATH, "r", encoding="utf-8") as f:
-    BOOKS_DB = json.load(f)
+
+try:
+    with open(BOOKS_PATH, "r", encoding="utf-8") as f:
+        BOOKS_DB = json.load(f)
+except Exception:
+    BOOKS_DB = {}
+
+reset_books_db()
 
 # =========================
 # Shared config and state
@@ -912,6 +924,61 @@ def get_top_book_candidates(data, limit=10):
         })
     return candidates
 
+def save_books_db():
+    global BOOKS_DB
+
+    try:
+        with open(BOOKS_PATH, "r", encoding="utf-8") as f:
+            file_books = json.load(f)
+    except Exception:
+        file_books = {}
+
+    file_books.update(BOOKS_DB)
+    BOOKS_DB = file_books
+
+    with open(BOOKS_PATH, "w", encoding="utf-8") as f:
+        json.dump(BOOKS_DB, f, indent=2, ensure_ascii=False)
+
+
+def make_lorem_pages(title: str, author: str | None = None, num_pages: int = 3):
+    author_text = f" by {author}" if author else ""
+    intro = f"{title}{author_text}\n\n"
+
+    filler = (
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
+        "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. "
+        "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. "
+        "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. "
+        "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
+    )
+
+    pages = []
+    for i in range(num_pages):
+        if i == 0:
+            page_text = intro + f"Page {i + 1}\n\n" + " ".join([filler] * 4)
+        else:
+            page_text = f"Page {i + 1}\n\n" + " ".join([filler] * 4)
+        pages.append(page_text)
+
+    return pages
+
+
+def add_book_to_local_db(title: str, author: str | None = None, series: str = "OpenLibrary"):
+    if not title:
+        return None
+
+    existing_title, existing_data = find_book_in_db(title)
+    if existing_data:
+        return existing_title
+
+    BOOKS_DB[title] = {
+        "series": series,
+        "pages": make_lorem_pages(title, author=author, num_pages=3),
+    }
+
+    save_books_db()
+    return title
+
 def get_candidate_page():
     if not pending_book_selection["active"]:
         return []
@@ -948,9 +1015,20 @@ def handle_book_candidate_selection(index: int):
     intent = pending_book_selection["intent"]
     query = pending_book_selection["query"]
 
+    selected_title = doc.get("title", "Unknown title")
+    selected_authors = doc.get("author_name", ["Unknown author"])
+    selected_author = selected_authors[0] if selected_authors else "Unknown author"
+
+    if intent == "GetBook":
+        add_book_to_local_db(
+            selected_title,
+            author=selected_author,
+            series="OpenLibrary",
+        )
+
     info = {
-        "title": doc.get("title", "Unknown title"),
-        "author_name": doc.get("author_name", ["Unknown author"]),
+        "title": selected_title,
+        "author_name": selected_authors,
         "first_publish_year": doc.get("first_publish_year", "Unknown year"),
         "docs": [doc],
     }
@@ -1325,9 +1403,9 @@ def generate_book_answer(intent, slots, info):
         title = info["title"]
         author = info["author_name"][0]
 
-        answer1 = f"I found {title} by {author}."
-        answer2 = f"The book I found is {title}, written by {author}."
-        answer3 = f"I found a result for that request: {title} by {author}."
+        answer1 = f"I found {title} by {author} and added it to your available books."
+        answer2 = f"The book I found is {title}, written by {author}. I also added it to your available books."
+        answer3 = f"I found a result for that request: {title} by {author}, and it is now in your available books."
         return random.choice([answer1, answer2, answer3])
 
     elif intent == "GetAuthor":
@@ -2216,8 +2294,16 @@ wake_model.load_weights("saved_intent_model/wake_model.weights.h5")
 # # =========================
 
 def find_book_in_db(requested_title: str):
+    global BOOKS_DB
+
     if not requested_title:
         return None, None
+
+    try:
+        with open(BOOKS_PATH, "r", encoding="utf-8") as f:
+            BOOKS_DB = json.load(f)
+    except Exception:
+        BOOKS_DB = {}
 
     requested_title = requested_title.strip().lower()
 
