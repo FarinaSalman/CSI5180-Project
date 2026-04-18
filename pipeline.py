@@ -1557,10 +1557,16 @@ def build_qwen_prompt(intent,slots,info = None):
         )
     elif intent == "GetBooksByAuthor":
         author_name = slots.get("author_name") or slots.get("name") or slots.get("NAME")
-        task = (
-            f"Generate a short response giving the titles of books by {author_name}. "
-            f"Do not ask follow-up questions."
-        )
+        if info and info.get("docs"):
+            titles = [d["title"] for d in info["docs"][:5] if "title" in d]
+            titles_text = ", ".join(titles)
+            task = (
+                f"The following books were found for {author_name}: {titles_text}. "
+                f"State this as one short natural sentence. "
+                f"Use only these titles — do not add any others."
+                    )
+        else:
+            task = f"Generate a short response listing books by {author_name}."
     elif intent == "GetPublishingYear":
         book_title = slots.get("book_title") or  slots.get("bname") or slots.get("BNAME")
         task = (
