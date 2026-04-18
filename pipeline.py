@@ -460,7 +460,7 @@ def verify_any_user(test_file, pin=None):
 WAKE_WORD_TEXT = "hey atlas"
 DURATION = 2.25
 NUM_SAMPLES = int(TARGET_SR * DURATION)
-WAKE_THRESHOLD = 0.70
+WAKE_THRESHOLD = 0.55
 
 def pad_or_truncate_audio(y, num_samples=NUM_SAMPLES):
     if len(y) > num_samples:

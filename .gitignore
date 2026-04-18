@@ -6,3 +6,4 @@ __pycache__/
 env/
 assistant_response.mp3
 assistant_response.wav
+books.json
