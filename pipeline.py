@@ -1447,6 +1447,8 @@ def generate_book_answer(intent, slots, info):
         answer3 = f"The listed author for {requested_title} is {author}."
         try:
             answer = generate_qwen_answer(intent, slots , info)
+            print(f"DEBUG LLM RAW ANSWER: {repr(answer)}")
+            print(f"DEBUG LLM ANSWER LEN: {len(answer) if answer is not None else 'None'}")
             if answer and len(answer) <= 300:
                 return answer
         except Exception:
@@ -1463,6 +1465,8 @@ def generate_book_answer(intent, slots, info):
         answer3 = f"{requested_title} appears to have first been published in {year}."
         try:
             answer = generate_qwen_answer(intent, slots , info)
+            print(f"DEBUG LLM RAW ANSWER: {repr(answer)}")
+            print(f"DEBUG LLM ANSWER LEN: {len(answer) if answer is not None else 'None'}")
             if answer and len(answer) <= 300:
                 return answer
         except Exception:
@@ -1488,9 +1492,12 @@ def generate_book_answer(intent, slots, info):
         answer3 = f"{author} has books such as {titles_text}."
         try:
             answer = generate_qwen_answer(intent, slots , info)
+            print(f"DEBUG LLM RAW ANSWER: {repr(answer)}")
+            print(f"DEBUG LLM ANSWER LEN: {len(answer) if answer is not None else 'None'}")
             if answer and len(answer) <= 300:
                 return answer
-        except Exception:
+        except Exception as e:
+            print(f"QWEN ERROR: {e}")
             pass # Fall back to templates if LLM fails
             
         return random.choice([answer1, answer2, answer3])
@@ -1544,19 +1551,24 @@ def build_qwen_prompt(intent,slots,info = None):
 
     if intent == "Greeting":
         task = "Generate a short greeting response."
+
     elif intent == "Goodbye":
         task = "Generate a short goodbye response."
+
     elif intent in ["SetTimer", "SetAlarm"]:
         duration = slots.get("duration", "the requested time")
         task = f"Generate a short response confirming that a timer was set for {duration}."
+
     elif intent == "GetAuthor":
         book_title = slots.get("book_title") or  slots.get("bname") or slots.get("BNAME") 
         task = (
             f"Generate a short response giving the author of the book titled '{book_title}'. "
             f"Do not ask follow-up questions."
         )
+
     elif intent == "GetBooksByAuthor":
         author_name = slots.get("author_name") or slots.get("name") or slots.get("NAME")
+<<<<<<< Updated upstream
         if info and info.get("docs"):
             titles = [d["title"] for d in info["docs"][:5] if "title" in d]
             titles_text = ", ".join(titles)
@@ -1567,25 +1579,37 @@ def build_qwen_prompt(intent,slots,info = None):
                     )
         else:
             task = f"Generate a short response listing books by {author_name}."
+=======
+        task = (
+            f"Generate a short response giving the titles of books by {author_name}. "
+            f"Do not ask follow-up questions."
+        )
+
+>>>>>>> Stashed changes
     elif intent == "GetPublishingYear":
         book_title = slots.get("book_title") or  slots.get("bname") or slots.get("BNAME")
         task = (
             f"Generate a short response giving the first publishing year of the book titled '{book_title}'. "
             f"Do not ask follow-up questions."
         )
+
     elif intent == "AskForWeather":
         city = slots.get("location") or slots.get("city") or "Ottawa"
         task = (
             f"Generate a short weather response for {city}. "
             f"Do not ask follow-up questions."
         )
+
     elif intent == "OpenBook":
         title = slots.get("title") or slots.get("book_title") or "Unknown Book"
         task = f"Generate a short response confirming that the book '{title}' was opened on page 1."
+
     elif intent == "NextPage":
         task = "Generate a short response confirming that the page was advanced."
+
     elif intent == "EnableDarkMode":
         task = "Generate a short response confirming that dark mode was enabled."
+
     else:
         task = "Generate a short helpful assistant response."
 
@@ -1598,7 +1622,7 @@ def build_qwen_prompt(intent,slots,info = None):
     )
 
 
-def generate_qwen_answer(intent, slots, max_new_tokens=256, info = None):
+def generate_qwen_answer(intent, slots, info = None, max_new_tokens=256):
     prompt = build_qwen_prompt(intent, slots, info = info)
     print(f"DEBUG LLM PROMPT:\n{prompt}\n")
     messages = [
@@ -1617,7 +1641,7 @@ def generate_qwen_answer(intent, slots, max_new_tokens=256, info = None):
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=80,
+            max_new_tokens=max_new_tokens,
             do_sample=True,       # slight variety vs greedy
             temperature=0.7,
             top_p=0.9
