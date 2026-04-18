@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import os
+import platform
+import shutil
 import subprocess
-import tempfile
 from pathlib import Path
-import winsound
 
-_current_audio_path: str | None = None
-
-import simpleaudio as sa
-
-FFMPEG_EXE = os.getenv("FFMPEG")
+_current_process: subprocess.Popen | None = None
 
 
 def validate_audio_file(file_path: str | os.PathLike) -> Path:
@@ -27,26 +23,72 @@ def validate_audio_file(file_path: str | os.PathLike) -> Path:
 
     return path
 
-def play_audio(file_path: str | os.PathLike, wait: bool = True):
-    global _current_audio_path
 
-    path = validate_audio_file(file_path)
-    _current_audio_path = str(path)
+def _play_with_subprocess(command: list[str], wait: bool) -> None:
+    global _current_process
 
     if wait:
-        winsound.PlaySound(_current_audio_path, winsound.SND_FILENAME)
+        subprocess.run(command, check=True)
+        _current_process = None
     else:
-        winsound.PlaySound(
-            _current_audio_path,
-            winsound.SND_FILENAME | winsound.SND_ASYNC
+        _current_process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
 
-    return _current_audio_path
+
+def play_audio(file_path: str | os.PathLike, wait: bool = True):
+    path = validate_audio_file(file_path)
+    system = platform.system()
+
+    if system == "Windows":
+        import winsound
+
+        if wait:
+            winsound.PlaySound(str(path), winsound.SND_FILENAME)
+        else:
+            winsound.PlaySound(
+                str(path),
+                winsound.SND_FILENAME | winsound.SND_ASYNC,
+            )
+        return str(path)
+
+    if system == "Darwin":
+        # macOS built-in player
+        _play_with_subprocess(["afplay", str(path)], wait)
+        return str(path)
+
+    # Linux / fallback
+    if shutil.which("ffplay"):
+        _play_with_subprocess(
+            ["ffplay", "-nodisp", "-autoexit", str(path)],
+            wait,
+        )
+        return str(path)
+
+    raise RuntimeError(
+        "No supported audio playback method found. "
+        "On macOS, afplay should exist. On Linux, install ffmpeg/ffplay."
+    )
+
 
 def stop_playback(play_result=None) -> None:
-    global _current_audio_path
-    winsound.PlaySound(None, 0)
-    _current_audio_path = None
+    global _current_process
+    system = platform.system()
+
+    if system == "Windows":
+        import winsound
+        winsound.PlaySound(None, 0)
+        return
+
+    if _current_process is not None:
+        try:
+            _current_process.terminate()
+        except Exception:
+            pass
+        _current_process = None
+
 
 if __name__ == "__main__":
     sample_file = "assistant_response.wav"
@@ -54,7 +96,7 @@ if __name__ == "__main__":
     try:
         print("Testing file:", Path(sample_file).resolve())
         print("Exists:", Path(sample_file).exists())
-        print("ffmpeg exists:", Path(FFMPEG_EXE).exists())
+        print("Platform:", platform.system())
         play_audio(sample_file, wait=True)
         print("Playback finished.")
     except Exception as e:
