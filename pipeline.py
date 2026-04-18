@@ -720,6 +720,29 @@ def predict_from_text(text, model, tokenizer, id2intent, id2slot, device):
     extracted_slots = {}
     words = text.split()
 
+    # for token_idx, word_idx in enumerate(word_ids):
+    #     if word_idx is None:
+    #         continue
+
+    #     slot_label = pred_slots[token_idx]
+    #     if slot_label == "O":
+    #         continue
+
+    #     if word_idx < len(words):
+    #         word = words[word_idx].strip(" ?.,!")
+    #         slot_type = slot_label.split("-")[-1].lower()
+
+    #         if slot_type not in extracted_slots:
+    #             extracted_slots[slot_type] = word
+    #         else:
+    #             extracted_slots[slot_type] += " " + word
+    
+    # Updated loop logic for pipeline.py
+
+
+    
+    processed_word_indices = set() # Track indices to avoid "gatsbytsby"
+
     for token_idx, word_idx in enumerate(word_ids):
         if word_idx is None:
             continue
@@ -728,14 +751,20 @@ def predict_from_text(text, model, tokenizer, id2intent, id2slot, device):
         if slot_label == "O":
             continue
 
-        if word_idx < len(words):
-            word = words[word_idx].strip(" ?.,!")
-            slot_type = slot_label.split("-")[-1].lower()
+        # Skip if we've already added this word from the original text
+        if word_idx in processed_word_indices:
+            continue
 
-            if slot_type not in extracted_slots:
-                extracted_slots[slot_type] = word
-            else:
-                extracted_slots[slot_type] += " " + word
+        slot_type = slot_label.split("-")[-1].lower()
+        word_to_add = words[word_idx].strip(" ?.,!")
+
+        if slot_type not in extracted_slots:
+            extracted_slots[slot_type] = word_to_add
+        else:
+            extracted_slots[slot_type] += " " + word_to_add
+        
+        # Mark this index as finished
+        processed_word_indices.add(word_idx)
 
     print(f"Input text : {text}")
     print(f"Tokens     : {tokens}")
@@ -1411,10 +1440,18 @@ def generate_book_answer(intent, slots, info):
     elif intent == "GetAuthor":
         requested_title = slots.get("book_title", info["title"])
         author = info["author_name"][0]
+        print(f"DEBUG: requested_title='{requested_title}', author='{author}'")  # DEBUG
 
         answer1 = f"The author of {requested_title} is {author}."
         answer2 = f"{requested_title} was written by {author}."
         answer3 = f"The listed author for {requested_title} is {author}."
+        try:
+            answer = generate_qwen_answer(intent, slots , info)
+            if answer and len(answer) <= 300:
+                return answer
+        except Exception:
+            pass # Fall back to templates if LLM fails
+            
         return random.choice([answer1, answer2, answer3])
 
     elif intent == "GetPublishingYear":
@@ -1424,6 +1461,13 @@ def generate_book_answer(intent, slots, info):
         answer1 = f"{requested_title} was first published in {year}."
         answer2 = f"The first publish year listed for {requested_title} is {year}."
         answer3 = f"{requested_title} appears to have first been published in {year}."
+        try:
+            answer = generate_qwen_answer(intent, slots , info)
+            if answer and len(answer) <= 300:
+                return answer
+        except Exception:
+            pass # Fall back to templates if LLM fails
+            
         return random.choice([answer1, answer2, answer3])
 
     elif intent == "GetBooksByAuthor":
@@ -1442,6 +1486,13 @@ def generate_book_answer(intent, slots, info):
         answer1 = f"Some books by {author} include {titles_text}."
         answer2 = f"I found these books by {author}: {titles_text}."
         answer3 = f"{author} has books such as {titles_text}."
+        try:
+            answer = generate_qwen_answer(intent, slots , info)
+            if answer and len(answer) <= 300:
+                return answer
+        except Exception:
+            pass # Fall back to templates if LLM fails
+            
         return random.choice([answer1, answer2, answer3])
 
     return "Sorry, I could not generate a book answer."
@@ -1487,9 +1538,9 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 
-def build_qwen_prompt(request):
-    intent = request["intent"]
-    slots = request.get("slots", {})
+def build_qwen_prompt(intent,slots,info = None):
+    # intent = request["intent"]
+    # slots = request.get("slots", {})
 
     if intent == "Greeting":
         task = "Generate a short greeting response."
@@ -1499,13 +1550,19 @@ def build_qwen_prompt(request):
         duration = slots.get("duration", "the requested time")
         task = f"Generate a short response confirming that a timer was set for {duration}."
     elif intent == "GetAuthor":
-        book_title = slots.get("book_title", "")
+        book_title = slots.get("book_title") or  slots.get("bname") or slots.get("BNAME") 
         task = (
             f"Generate a short response giving the author of the book titled '{book_title}'. "
             f"Do not ask follow-up questions."
         )
+    elif intent == "GetBooksByAuthor":
+        author_name = slots.get("author_name") or slots.get("name") or slots.get("NAME")
+        task = (
+            f"Generate a short response giving the titles of books by {author_name}. "
+            f"Do not ask follow-up questions."
+        )
     elif intent == "GetPublishingYear":
-        book_title = slots.get("book_title", "")
+        book_title = slots.get("book_title") or  slots.get("bname") or slots.get("BNAME")
         task = (
             f"Generate a short response giving the first publishing year of the book titled '{book_title}'. "
             f"Do not ask follow-up questions."
@@ -1535,9 +1592,9 @@ def build_qwen_prompt(request):
     )
 
 
-def generate_qwen_answer(request, max_new_tokens=256):
-    prompt = build_qwen_prompt(request)
-
+def generate_qwen_answer(intent, slots, max_new_tokens=256, info = None):
+    prompt = build_qwen_prompt(intent, slots, info = info)
+    print(f"DEBUG LLM PROMPT:\n{prompt}\n")
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": prompt}
@@ -1554,8 +1611,10 @@ def generate_qwen_answer(request, max_new_tokens=256):
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False
+            max_new_tokens=80,
+            do_sample=True,       # slight variety vs greedy
+            temperature=0.7,
+            top_p=0.9
         )
 
     generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
